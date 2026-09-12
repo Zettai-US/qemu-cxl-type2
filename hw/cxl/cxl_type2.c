@@ -1403,6 +1403,72 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
 static uint64_t cxl_type2_gpu_cmd_read(void *opaque, hwaddr addr, unsigned size);
 static void cxl_type2_gpu_cmd_write(void *opaque, hwaddr addr, uint64_t value, unsigned size);
 
+/* Modeled-timing helpers calibrated from the C2 Sight CXL Type-2
+ * characterization (paper.pdf; calibration/c2sight_type2).  Costs are
+ * device-side accounting only -- they never stall the guest. */
+static uint64_t cxl_type2_link_ns(CXLType2State *ct2d, uint64_t bytes)
+{
+    /* Serialized transfer time at the CXL link ceiling; bandwidth_gbps is
+     * in GB/s == bytes/ns. */
+    if (!ct2d->latency_enabled || !ct2d->bandwidth_gbps) {
+        return 0;
+    }
+    return bytes / ct2d->bandwidth_gbps;
+}
+
+static uint64_t cxl_type2_model_read_ns(CXLType2State *ct2d, bool hit,
+                                        uint64_t bytes)
+{
+    uint64_t ns;
+
+    if (!ct2d->latency_enabled) {
+        return 0;
+    }
+    ns = ct2d->read_latency_ns;
+    if (!hit) {
+        ns += ct2d->coherency_latency_ns; /* CXL.mem fill round trip */
+    }
+    return ns + cxl_type2_link_ns(ct2d, bytes);
+}
+
+static uint64_t cxl_type2_model_write_ns(CXLType2State *ct2d, bool hit,
+                                         uint64_t bytes)
+{
+    uint64_t ns;
+
+    if (!ct2d->latency_enabled) {
+        return 0;
+    }
+    ns = ct2d->write_latency_ns;
+    if (!hit) {
+        ns += ct2d->coherency_latency_ns;
+    }
+    return ns + cxl_type2_link_ns(ct2d, bytes);
+}
+
+/* Bulk-transfer accounting: a device-directed push (HTOD) charges one
+ * media-write rail per 64B line through the link; a device consume (DTOH)
+ * charges device-cache read rails.  Kept separate from the per-access rail
+ * counters so rail verification stays exact. */
+static void cxl_type2_charge_bulk(CXLType2State *ct2d, uint64_t bytes,
+                                  bool write)
+{
+    uint64_t lines, ns;
+
+    if (!ct2d->latency_enabled || !bytes) {
+        return;
+    }
+    lines = (bytes + 63) / 64;
+    ns = lines * (write ? ct2d->write_latency_ns : ct2d->read_latency_ns) +
+         cxl_type2_link_ns(ct2d, bytes);
+    ct2d->timing.acc_ns += ns;
+    if (write) {
+        ct2d->timing.bulk_write_ns += ns;
+    } else {
+        ct2d->timing.bulk_read_ns += ns;
+    }
+}
+
 static uint64_t cxl_type2_coherent_mem_read(void *opaque, hwaddr addr,
                                             unsigned size)
 {
@@ -1411,6 +1477,8 @@ static uint64_t cxl_type2_coherent_mem_read(void *opaque, hwaddr addr,
     uint64_t value = 0;
     uint64_t cache_line_addr = addr & ~0x3F;
     size_t offset = addr & 0x3F;
+    bool hit;
+    bool filled = false;
 
     ct2d->stats.cpu_accesses++;
 
@@ -1424,8 +1492,9 @@ static uint64_t cxl_type2_coherent_mem_read(void *opaque, hwaddr addr,
 
     /* Check coherency protocol */
     line = cxl_type2_cache_lookup(ct2d, addr);
+    hit = line && line->state != CXL_COHERENCY_INVALID;
 
-    if (line && line->state != CXL_COHERENCY_INVALID) {
+    if (hit) {
         /* Cache hit */
         memcpy(&value, &line->data[offset], MIN(size, 64 - offset));
 
@@ -1437,16 +1506,39 @@ static uint64_t cxl_type2_coherent_mem_read(void *opaque, hwaddr addr,
         if (mem_ptr && addr < ct2d->device_mem_size) {
             memcpy(&value, mem_ptr + addr, size);
 
-            /* Insert into cache */
-            uint8_t cache_data[64];
-            memcpy(cache_data, mem_ptr + cache_line_addr, 64);
-            cxl_type2_cache_insert(ct2d, addr, cache_data, CXL_COHERENCY_SHARED);
+            /* Insert into cache (allocating request class) */
+            if (ct2d->allocate_on_miss) {
+                uint8_t cache_data[64];
+                memcpy(cache_data, mem_ptr + cache_line_addr, 64);
+                cxl_type2_cache_insert(ct2d, addr, cache_data,
+                                       CXL_COHERENCY_SHARED);
+                filled = true;
+            }
         }
 
         cxl_type2_memsim_request(ct2d, CXL_OP_READ, addr, size, NULL, NULL);
 
         qemu_log_mask(LOG_TRACE, "CXL Type2: Cache read miss at 0x%lx = 0x%lx\n",
                      addr, value);
+    }
+
+    if (ct2d->latency_enabled) {
+        uint64_t ns = cxl_type2_model_read_ns(ct2d, hit, size);
+        ct2d->timing.acc_ns += ns;
+        if (hit) {
+            ct2d->timing.hit_count++;
+            ct2d->timing.hit_ns += ns;
+        } else {
+            ct2d->timing.miss_count++;
+            ct2d->timing.miss_ns += ns;
+            if (filled && ct2d->hmc_install_ns) {
+                /* DCOH device-cache install: one fill serialized per
+                 * hmc_install_ns bounds the allocating fill rate. */
+                ct2d->timing.acc_ns += ct2d->hmc_install_ns;
+                ct2d->timing.install_count++;
+                ct2d->timing.install_ns += ct2d->hmc_install_ns;
+            }
+        }
     }
 
     ct2d->stats.read_ops++;
@@ -1468,6 +1560,8 @@ static void cxl_type2_coherent_mem_write(void *opaque, hwaddr addr,
 {
     CXLType2State *ct2d = opaque;
     CXLCacheLine *line;
+    bool hit;
+    bool filled;
     uint64_t cache_line_addr = addr & ~0x3F;
     size_t offset = addr & 0x3F;
 
@@ -1497,15 +1591,21 @@ static void cxl_type2_coherent_mem_write(void *opaque, hwaddr addr,
 
     /* Check if we have the cache line */
     line = cxl_type2_cache_lookup(ct2d, addr);
+    hit = line && line->state != CXL_COHERENCY_INVALID;
+    filled = false;
 
-    if (!line || line->state == CXL_COHERENCY_INVALID) {
+    if (!hit) {
         /* Need to fetch cache line first */
         uint8_t *mem_ptr = memory_region_get_ram_ptr(&ct2d->device_mem);
         if (mem_ptr && cache_line_addr < ct2d->device_mem_size) {
-            uint8_t cache_data[64];
-            memcpy(cache_data, mem_ptr + cache_line_addr, 64);
-            cxl_type2_cache_insert(ct2d, addr, cache_data, CXL_COHERENCY_MODIFIED);
-            line = cxl_type2_cache_lookup(ct2d, addr);
+            if (ct2d->allocate_on_miss) {
+                uint8_t cache_data[64];
+                memcpy(cache_data, mem_ptr + cache_line_addr, 64);
+                cxl_type2_cache_insert(ct2d, addr, cache_data,
+                                       CXL_COHERENCY_MODIFIED);
+                line = cxl_type2_cache_lookup(ct2d, addr);
+                filled = line != NULL;
+            }
         }
     }
 
@@ -1524,6 +1624,18 @@ static void cxl_type2_coherent_mem_write(void *opaque, hwaddr addr,
             memcpy(mem_ptr + addr, &value, size);
         }
 
+    }
+
+    if (ct2d->latency_enabled) {
+        uint64_t ns = cxl_type2_model_write_ns(ct2d, hit, size);
+        ct2d->timing.acc_ns += ns;
+        ct2d->timing.write_count++;
+        ct2d->timing.write_ns += ns;
+        if (filled && ct2d->hmc_install_ns) {
+            ct2d->timing.acc_ns += ct2d->hmc_install_ns;
+            ct2d->timing.install_count++;
+            ct2d->timing.install_ns += ct2d->hmc_install_ns;
+        }
     }
 
     qemu_log_mask(LOG_TRACE, "CXL Type2: Cache write at 0x%lx = 0x%lx\n",
@@ -2280,6 +2392,24 @@ static int cxl_coherent_pool_free(CXLType2State *ct2d, uint64_t offset)
  * GPU Command Interface
  * ======================================================================== */
 
+/*
+ * GPU-side copies update device_mem without going through the BAR handlers.
+ * Drop every overlapping CPU cache line before the next BAR read. The BAR
+ * cache is write-through, so these entries contain no uncommitted CPU data.
+ */
+static void cxl_type2_invalidate_shadow_range(CXLType2State *ct2d,
+                                             uint64_t addr, size_t size)
+{
+    if (!size) {
+        return;
+    }
+
+    for (uint64_t line = addr & CXL_CACHE_LINE_MASK;
+         line < addr + size; line += CXL_CACHE_LINE_SIZE) {
+        cxl_type2_cache_invalidate(ct2d, line);
+    }
+}
+
 static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
 {
     HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
@@ -2411,10 +2541,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             break;
         }
+        cxl_type2_charge_bulk(ct2d, size, true); /* push through the link */
         if (hetgpu->initialized) {
             err = hetgpu_memcpy_htod(hetgpu, dev_ptr, ct2d->gpu_cmd.data, size);
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
             }
             /* Also update shadow copy in device_mem for coherency tracking */
             if (dev_ptr + size <= ct2d->device_mem_size &&
@@ -2423,6 +2555,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
                     memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
+                    cxl_type2_invalidate_shadow_range(ct2d, dev_ptr, size);
                     /* Notify BAR coherency layer of GPU write */
                     if (ct2d->bar_coherency.enabled) {
                         cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
@@ -2438,6 +2571,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
                     memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
+                    cxl_type2_invalidate_shadow_range(ct2d, dev_ptr, size);
                     /* Notify BAR coherency layer of GPU write */
                     if (ct2d->bar_coherency.enabled) {
                         cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
@@ -2457,6 +2591,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
             break;
         }
+        cxl_type2_charge_bulk(ct2d, size, false); /* device consume */
         if (hetgpu->initialized) {
             /* Notify BAR coherency layer before GPU read */
             if (ct2d->bar_coherency.enabled) {
@@ -2466,6 +2601,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             err = hetgpu_memcpy_dtoh(hetgpu, ct2d->gpu_cmd.data, dev_ptr, size);
             if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
             }
             /* Update shadow copy from GPU for coherency */
             if (dev_ptr + size <= ct2d->device_mem_size &&
@@ -2474,6 +2610,7 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
                 if (mem) {
                     memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
+                    cxl_type2_invalidate_shadow_range(ct2d, dev_ptr, size);
                 }
             }
         } else {
@@ -2626,6 +2763,9 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                                              src_dev_ptr, xfer_size);
                     if (err != HETGPU_SUCCESS) {
                         ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    } else {
+                        cxl_type2_invalidate_shadow_range(ct2d, bar4_offset,
+                                                         xfer_size);
                     }
                 } else {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
@@ -2926,6 +3066,93 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                    sizeof(ct2d->bar_coherency.stats));
             ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
         }
+        break;
+
+    /* ---- Modeled-timing commands (calibration/c2sight_type2) ---- */
+    case CXL_GPU_CMD_NOTIFY_BATCH:
+        {
+            /*
+             * Producer notification model calibrated from the C2 Sight
+             * paper: each notification is one cacheline-granular event
+             * written into device memory (HDM media write rail), and each
+             * batch completes with a single host-visible doorbell/GO round
+             * trip (coherency rail).  Batching amortizes the completion,
+             * not the media write.  params: [0]=base offset, [1]=count,
+             * [2]=batch size (0 -> 1), [3]=payload bytes (0 -> 64).
+             */
+            uint64_t base = ct2d->gpu_cmd.params[0];
+            uint64_t count = ct2d->gpu_cmd.params[1];
+            uint64_t batch = ct2d->gpu_cmd.params[2];
+            uint64_t payload = ct2d->gpu_cmd.params[3];
+            uint64_t per_notify, batches, total = 0;
+
+            if (!batch) {
+                batch = 1;
+            }
+            if (!payload) {
+                payload = 64;
+            }
+            if (!count || payload < 8 || payload > 4096 ||
+                count > (1ULL << 32) ||
+                base > ct2d->device_mem_size ||
+                count * 64 > ct2d->device_mem_size - base) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+
+            uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
+            for (uint64_t i = 0; i < count; i++) {
+                mem[base + i * 64] = (uint8_t)(i + 1); /* touch the event line */
+            }
+
+            batches = (count + batch - 1) / batch;
+            if (ct2d->latency_enabled) {
+                per_notify = ct2d->write_latency_ns +
+                             cxl_type2_link_ns(ct2d, payload);
+                total = count * per_notify +
+                        batches * ct2d->coherency_latency_ns;
+                ct2d->timing.acc_ns += total;
+                ct2d->timing.notify_count += count;
+                ct2d->timing.notify_batch_count += batches;
+                ct2d->timing.notify_ns += count * per_notify;
+                ct2d->timing.notify_completion_ns +=
+                        batches * ct2d->coherency_latency_ns;
+            }
+
+            ct2d->gpu_cmd.results[0] = count;
+            ct2d->gpu_cmd.results[1] = total;
+            ct2d->gpu_cmd.results[2] = total / count; /* avg per notification */
+            ct2d->gpu_cmd.results[3] = batches;
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        }
+        break;
+
+    case CXL_GPU_CMD_TIMING_GET:
+        ct2d->gpu_cmd.results[0] = ct2d->timing.acc_ns;
+        ct2d->gpu_cmd.results[1] = ct2d->timing.hit_count;
+        ct2d->gpu_cmd.results[2] = ct2d->timing.miss_count;
+        ct2d->gpu_cmd.results[3] = ct2d->timing.notify_count;
+        if (ct2d->gpu_cmd.data_size >= 192) {
+            uint64_t *timing_buf = (uint64_t *)ct2d->gpu_cmd.data;
+            timing_buf[0] = ct2d->timing.hit_ns;
+            timing_buf[1] = ct2d->timing.miss_ns;
+            timing_buf[2] = ct2d->timing.write_count;
+            timing_buf[3] = ct2d->timing.write_ns;
+            timing_buf[4] = ct2d->timing.notify_ns;
+            timing_buf[5] = ct2d->timing.notify_completion_ns;
+            timing_buf[6] = ct2d->timing.notify_batch_count;
+            timing_buf[7] = ct2d->latency_enabled ? ct2d->bandwidth_gbps : 0;
+            timing_buf[8] = ct2d->timing.bulk_read_ns;
+            timing_buf[9] = ct2d->timing.bulk_write_ns;
+            timing_buf[10] = ct2d->timing.install_count;
+            timing_buf[11] = ct2d->timing.install_ns;
+        }
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
+        break;
+
+    case CXL_GPU_CMD_TIMING_RESET:
+        memset(&ct2d->timing, 0, sizeof(ct2d->timing));
+        ct2d->gpu_cmd.cmd_result = CXL_GPU_SUCCESS;
         break;
 
     /* ---- DCD / GFAM / MH-SLD fabric-memory commands ---- */
@@ -3912,6 +4139,23 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_UINT32("mhsld-head-id", CXLType2State, mhsld.local_head_id, 0),
     DEFINE_PROP_UINT32("mhsld-coh-latency-ns", CXLType2State,
                        mhsld.coherency_latency_ns, 200),
+    /* Modeled-timing rails, calibrated from the C2 Sight CXL Type-2
+     * characterization (see calibration/c2sight_type2).  Off by default so
+     * functional tests see zero-cost accesses. */
+    DEFINE_PROP_BOOL("latency-enabled", CXLType2State, latency_enabled, false),
+    DEFINE_PROP_UINT32("read-latency-ns", CXLType2State, read_latency_ns,
+                       120), /* device-cache hit rail (paper HMC hit) */
+    DEFINE_PROP_UINT32("write-latency-ns", CXLType2State, write_latency_ns,
+                       250), /* HDM media write rail (derived host->HDM) */
+    DEFINE_PROP_UINT32("coherency-latency-ns", CXLType2State,
+                       coherency_latency_ns, 112), /* H2D round trip / fill */
+    DEFINE_PROP_UINT32("bandwidth-gbps", CXLType2State, bandwidth_gbps,
+                       51), /* serialized CXL link ceiling */
+    DEFINE_PROP_UINT32("hmc-install-ns", CXLType2State, hmc_install_ns,
+                       8), /* DCOH fill serialization (paper: 7.9ns/install
+                            * -> ~8 GB/s allocating fill ceiling) */
+    DEFINE_PROP_BOOL("allocate-on-miss", CXLType2State, allocate_on_miss,
+                     true), /* false = non-allocating (RdCurr class) */
 };
 
 static void cxl_type2_class_init(ObjectClass *oc, const void *data)

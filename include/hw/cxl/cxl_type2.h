@@ -270,11 +270,44 @@ typedef struct CXLType2State {
         uint64_t coherency_violations;
     } stats;
 
-    /* Latency simulation */
+    /* Latency simulation and modeled-timing accounting, calibrated against
+     * the C2 Sight CXL Type-2 characterization (paper.pdf; see
+     * calibration/c2sight_type2 in the CXLMemSim tree).
+     *   read_latency_ns      device-cache hit rail (paper HMC hit, 120ns)
+     *   write_latency_ns     HDM media write rail (derived host->HDM, 250ns)
+     *   coherency_latency_ns H2D notification/snoop round trip and the
+     *                        miss-fill CXL.mem cost (derived 45+22+45, 112ns)
+     *   bandwidth_gbps       serialized CXL link ceiling (paper 51 GB/s) */
     bool latency_enabled;
     uint32_t read_latency_ns;
     uint32_t write_latency_ns;
     uint32_t coherency_latency_ns;
+    uint32_t bandwidth_gbps;
+    /* DCOH allocation backpressure: device-cache fills serialize at one
+     * install per hmc_install_ns (C2 Sight: 7.9ns -> 8.1 GB/s fill ceiling,
+     * the 6.2x allocating-vs-non-allocating gap).  allocate_on_miss off
+     * models non-allocating requests (RdCurr class): no fill, no install. */
+    uint32_t hmc_install_ns;
+    bool allocate_on_miss;
+
+    /* Cumulative modeled device time in ns; reported via TIMING_GET. */
+    struct {
+        uint64_t acc_ns;
+        uint64_t hit_count;
+        uint64_t hit_ns;
+        uint64_t miss_count;
+        uint64_t miss_ns;
+        uint64_t write_count;
+        uint64_t write_ns;
+        uint64_t notify_count;
+        uint64_t notify_batch_count;
+        uint64_t notify_ns;
+        uint64_t notify_completion_ns;
+        uint64_t bulk_read_ns;   /* device-directed consume (DTOH) */
+        uint64_t bulk_write_ns;  /* device-directed push (HTOD) */
+        uint64_t install_count;
+        uint64_t install_ns;
+    } timing;
 
 } CXLType2State;
 

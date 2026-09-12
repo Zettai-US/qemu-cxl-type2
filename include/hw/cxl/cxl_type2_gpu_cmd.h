@@ -169,6 +169,11 @@ typedef enum {
     CXL_GPU_CMD_SWITCH_GET_STATS    = 0xE5,  /* results/data: server switch stats */
     CXL_GPU_CMD_SWITCH_HWJIT        = 0xE6,  /* params: src, dst, bytes, switchlet, mask, tiles, control, aux */
     CXL_GPU_CMD_SWITCH_HWJIT_STATS  = 0xE7,  /* results/data: Hardware-JIT stats */
+
+    /* Modeled-timing commands (calibration/c2sight_type2) */
+    CXL_GPU_CMD_NOTIFY_BATCH        = 0xF0,  /* params: base, count, batch, payload */
+    CXL_GPU_CMD_TIMING_GET          = 0xF1,  /* results/data: modeled timing accounting */
+    CXL_GPU_CMD_TIMING_RESET        = 0xF2,  /* zero the timing accounting */
 } CXLGPUCommand;
 
 typedef struct CXLSwitchMatmulI32Descriptor {
