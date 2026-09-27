@@ -261,6 +261,12 @@ typedef struct CXLType2State {
         QemuMutex lock;
     } coherent_pool;
 
+    /* Opt-in SlugArch native endpoint experiment. */
+    bool slugarch_enabled, slugarch_enforce;
+    uint32_t slugarch_compute_ns, slugarch_record_ns;
+    uint32_t slugarch_bandwidth, slugarch_link_ns;
+    struct CXLSlugArchState *slugarch;
+
     /* Statistics and monitoring */
     struct {
         uint64_t read_ops;

@@ -29,6 +29,7 @@
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/cxl/cxl_type2_coherency.h"
+#include "hw/cxl/cxl_slugarch.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pcie.h"
 #include "hw/pci/msix.h"
@@ -1547,6 +1548,12 @@ static uint64_t cxl_type2_coherent_mem_read(void *opaque, hwaddr addr,
 
 static uint64_t cxl_type2_cache_read(void *opaque, hwaddr addr, unsigned size)
 {
+    CXLType2State *ct2d = opaque;
+
+    if (ct2d->slugarch && addr >= SLUGARCH_MMIO_BASE &&
+        addr + size <= SLUGARCH_MMIO_BASE + SLUGARCH_MMIO_SIZE) {
+        return cxl_slugarch_read(ct2d, addr - SLUGARCH_MMIO_BASE, size);
+    }
     /* BAR2 reserves its low range for the GPU command interface. */
     if (addr < CXL_GPU_CMD_REG_SIZE) {
         return cxl_type2_gpu_cmd_read(opaque, addr, size);
@@ -1645,6 +1652,13 @@ static void cxl_type2_coherent_mem_write(void *opaque, hwaddr addr,
 static void cxl_type2_cache_write(void *opaque, hwaddr addr, uint64_t value,
                                   unsigned size)
 {
+    CXLType2State *ct2d = opaque;
+
+    if (ct2d->slugarch && addr >= SLUGARCH_MMIO_BASE &&
+        addr + size <= SLUGARCH_MMIO_BASE + SLUGARCH_MMIO_SIZE) {
+        cxl_slugarch_write(ct2d, addr - SLUGARCH_MMIO_BASE, value, size);
+        return;
+    }
     /* BAR2 reserves its low range for the GPU command interface. */
     if (addr < CXL_GPU_CMD_REG_SIZE) {
         cxl_type2_gpu_cmd_write(opaque, addr, value, size);
@@ -2805,7 +2819,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 cxl_type2_memsim_request(ct2d, CXL_OP_FENCE, flush_addr,
                                          flush_size, NULL, NULL);
                 /* Invalidate local cache entries */
-                for (uint64_t addr = flush_addr; addr < flush_addr + flush_size; addr += 64) {
+                for (uint64_t addr = flush_addr & ~0x3F;
+                     addr < flush_addr + flush_size; addr += 64) {
                     cxl_type2_cache_invalidate(ct2d, addr);
                 }
                 ct2d->coherency.coherency_ops++;
@@ -2820,7 +2835,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             size_t inv_size = ct2d->gpu_cmd.params[1];
 
             if (ct2d->coherency.coherency_enabled) {
-                for (uint64_t addr = inv_addr; addr < inv_addr + inv_size; addr += 64) {
+                for (uint64_t addr = inv_addr & ~0x3F;
+                     addr < inv_addr + inv_size; addr += 64) {
                     cxl_type2_cache_invalidate(ct2d, addr);
                 }
                 ct2d->coherency.coherency_ops++;
@@ -2835,7 +2851,8 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
             size_t wb_size = ct2d->gpu_cmd.params[1];
 
             if (ct2d->coherency.coherency_enabled) {
-                for (uint64_t addr = wb_addr; addr < wb_addr + wb_size; addr += 64) {
+                for (uint64_t addr = wb_addr & ~0x3F;
+                     addr < wb_addr + wb_size; addr += 64) {
                     cxl_type2_cache_writeback(ct2d, addr);
                 }
                 ct2d->coherency.coherency_ops++;
@@ -3824,6 +3841,19 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     CXLComponentState *cxl_cstate = &ct2d->cxl_cstate;
     Error *local_err = NULL;
 
+    if (ct2d->slugarch_enabled &&
+        (!ct2d->slugarch_bandwidth || !ct2d->slugarch_compute_ns ||
+         ct2d->slugarch_compute_ns > 1000000 ||
+         ct2d->slugarch_record_ns > 1000000 ||
+         ct2d->slugarch_link_ns > 1000000 ||
+         ct2d->cache_size < SLUGARCH_MMIO_BASE + SLUGARCH_MMIO_SIZE ||
+         ct2d->gpu_info.mode != CXL_TYPE2_GPU_MODE_NONE ||
+         ct2d->direct_shared_mem || ct2d->dcd.enabled || ct2d->gfam.enabled)) {
+        error_setg(errp, "SlugArch requires local gpu-mode=0, no DCD/GFAM, "
+                   "cache >= 0x221000, positive bandwidth/compute, and "
+                   "compute/record/link costs <= 1000000 ns");
+        return;
+    }
     pci_config_set_prog_interface(pci_dev->config, 0x10);
 
     /* Set default values */
@@ -4034,6 +4064,7 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 
     /* Connect to CXLMemSim. The TCP server protocol is request/response. */
     cxlmemsim_connect(ct2d);
+    cxl_slugarch_init(ct2d);
 
     qemu_log("CXL Type2: Device realized - Cache: %zu MB, DevMem: %zu MB\n",
              ct2d->cache_size / MiB, ct2d->device_mem_size / MiB);
@@ -4042,6 +4073,8 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 static void cxl_type2_exit(PCIDevice *pci_dev)
 {
     CXLType2State *ct2d = CXL_TYPE2(pci_dev);
+
+    cxl_slugarch_cleanup(ct2d);
 
     /* Disconnect from CXLMemSim */
     cxlmemsim_disconnect(ct2d);
@@ -4093,6 +4126,12 @@ static void cxl_type2_exit(PCIDevice *pci_dev)
 }
 
 static const Property cxl_type2_props[] = {
+    DEFINE_PROP_BOOL("slugarch", CXLType2State, slugarch_enabled, false),
+    DEFINE_PROP_BOOL("slugarch-enforce", CXLType2State, slugarch_enforce, true),
+    DEFINE_PROP_UINT32("slugarch-compute-ns", CXLType2State, slugarch_compute_ns, 8),
+    DEFINE_PROP_UINT32("slugarch-record-ns", CXLType2State, slugarch_record_ns, 64),
+    DEFINE_PROP_UINT32("slugarch-bandwidth", CXLType2State, slugarch_bandwidth, 16),
+    DEFINE_PROP_UINT32("slugarch-link-ns", CXLType2State, slugarch_link_ns, 200),
     DEFINE_PROP_SIZE("cache-size", CXLType2State, cache_size,
                      CXL_TYPE2_DEFAULT_CACHE_SIZE),
     DEFINE_PROP_SIZE("mem-size", CXLType2State, device_mem_size,
