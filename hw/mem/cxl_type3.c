@@ -33,6 +33,7 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include "hw/cxl/cxl.h"
+#include "hw/cxl/cxl_type3_memsim.h"
 #include "hw/pci/msix.h"
 
 /* type3 device private */
@@ -877,6 +878,7 @@ static void init_alert_config(CXLType3Dev *ct3d)
 
 static bool cxl_memsim_boot_enabled(CXLType3Dev *ct3d);
 static void cxl_memsim_init(CXLType3Dev *ct3d);
+static void cxl_type3_memsim_atomic_bar_init(CXLType3Dev *ct3d);
 
 static void ct3_realize(PCIDevice *pci_dev, Error **errp)
 {
@@ -978,6 +980,10 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
         ct3d->ecs_attrs.fru_attrs[count].ecs_flags = 0;
     }
 
+    if (ct3d->memsim_atomics) {
+        cxl_type3_memsim_atomic_bar_init(ct3d);
+    }
+
     return;
 
 err_release_cdat:
@@ -1009,6 +1015,9 @@ static void ct3_exit(PCIDevice *pci_dev)
     msix_uninit_exclusive_bar(pci_dev);
     g_free(regs->special_ops);
     cxl_destroy_cci(&ct3d->cci);
+    if (ct3d->memsim_atomics) {
+        qemu_mutex_destroy(&ct3d->memsim_atomic_lock);
+    }
     if (ct3d->dc.host_dc) {
         cxl_destroy_dc_regions(ct3d);
         host_memory_backend_set_mapped(ct3d->dc.host_dc, false);
@@ -2377,37 +2386,183 @@ static int cxl_memsim_request(uint8_t op, uint64_t addr, uint64_t size,
     return cxl_memsim_request_ext(op, addr, size, data, 0, 0, resp);
 }
 
-/* Atomic Fetch-and-Add operation */
-static int __attribute__((unused))
-cxl_memsim_atomic_faa(uint64_t addr, uint64_t add_value, uint64_t *old_value) {
+/*
+ * Execute an explicit atomic command from the vendor BAR.  Normal accesses to
+ * the CXL fixed memory window cannot use this path automatically: neither the
+ * KVM MMIO exit nor MemoryRegionOps says that a read/write pair originated
+ * from LOCK XADD or CMPXCHG.
+ */
+static void cxl_type3_memsim_atomic_execute(CXLType3Dev *ct3d)
+{
     CXLMemSimResponse resp = {0};
-    int ret = cxl_memsim_request_ext(CXL_OP_ATOMIC_FAA, addr, sizeof(uint64_t),
-                                     NULL, add_value, 0, &resp);
-    if (ret == 0 && old_value) {
-        *old_value = resp.old_value;
+    uint8_t wire_op;
+    int ret;
+
+    ct3d->memsim_atomic_status = CXL_T3_MEMSIM_STATUS_BUSY;
+    ct3d->memsim_atomic_server_status = 0;
+    ct3d->memsim_atomic_old_value = 0;
+
+    switch (ct3d->memsim_atomic_op) {
+    case CXL_T3_MEMSIM_OP_FAA:
+        wire_op = CXL_OP_ATOMIC_FAA;
+        break;
+    case CXL_T3_MEMSIM_OP_CAS:
+        wire_op = CXL_OP_ATOMIC_CAS;
+        break;
+    case CXL_T3_MEMSIM_OP_FENCE:
+        wire_op = CXL_OP_FENCE;
+        break;
+    default:
+        ct3d->memsim_atomic_server_status = CXL_DCD_STATUS_INVALID_REQUEST;
+        ct3d->memsim_atomic_status = CXL_T3_MEMSIM_STATUS_ERROR;
+        return;
     }
-    return ret;
+
+    if (wire_op != CXL_OP_FENCE && (ct3d->memsim_atomic_addr & 7)) {
+        ct3d->memsim_atomic_server_status = CXL_DCD_STATUS_INVALID_REQUEST;
+        ct3d->memsim_atomic_status = CXL_T3_MEMSIM_STATUS_ERROR;
+        return;
+    }
+
+    cxl_memsim_init(ct3d);
+    if (g_memsim.transport_mode == CXL_TRANSPORT_RDMA) {
+        /* The legacy RDMA request ABI has no value/expected operands. */
+        ct3d->memsim_atomic_server_status =
+            CXL_T3_MEMSIM_SERVER_STATUS_TRANSPORT_ERROR;
+        ct3d->memsim_atomic_status = CXL_T3_MEMSIM_STATUS_ERROR;
+        return;
+    }
+    ret = cxl_memsim_request_ext(wire_op, ct3d->memsim_atomic_addr,
+                                 wire_op == CXL_OP_FENCE ? 0 : sizeof(uint64_t),
+                                 NULL, ct3d->memsim_atomic_value,
+                                 ct3d->memsim_atomic_expected, &resp);
+    if (ret < 0) {
+        ct3d->memsim_atomic_server_status =
+            CXL_T3_MEMSIM_SERVER_STATUS_TRANSPORT_ERROR;
+        ct3d->memsim_atomic_status = CXL_T3_MEMSIM_STATUS_ERROR;
+        return;
+    }
+
+    ct3d->memsim_atomic_server_status = resp.status;
+    ct3d->memsim_atomic_old_value = resp.old_value;
+    ct3d->memsim_atomic_status = resp.status == 0
+                                     ? CXL_T3_MEMSIM_STATUS_DONE
+                                     : CXL_T3_MEMSIM_STATUS_ERROR;
 }
 
-/* Atomic Compare-and-Swap operation */
-static int __attribute__((unused))
-cxl_memsim_atomic_cas(uint64_t addr, uint64_t expected, uint64_t desired,
-                      uint64_t *old_value) {
-    CXLMemSimResponse resp = {0};
-    int ret = cxl_memsim_request_ext(CXL_OP_ATOMIC_CAS, addr, sizeof(uint64_t),
-                                     NULL, desired, expected, &resp);
-    if (ret == 0 && old_value) {
-        *old_value = resp.old_value;
+static uint64_t cxl_type3_memsim_atomic_read(void *opaque, hwaddr offset,
+                                             unsigned size)
+{
+    CXLType3Dev *ct3d = opaque;
+    uint64_t value = 0;
+
+    (void)size;
+
+    qemu_mutex_lock(&ct3d->memsim_atomic_lock);
+    switch (offset) {
+    case CXL_T3_MEMSIM_REG_MAGIC:
+        value = CXL_T3_MEMSIM_ATOMIC_MAGIC;
+        break;
+    case CXL_T3_MEMSIM_REG_VERSION:
+        value = CXL_T3_MEMSIM_ATOMIC_VERSION;
+        break;
+    case CXL_T3_MEMSIM_REG_CAPS:
+        value = CXL_T3_MEMSIM_CAP_FAA | CXL_T3_MEMSIM_CAP_CAS |
+                CXL_T3_MEMSIM_CAP_FENCE;
+        break;
+    case CXL_T3_MEMSIM_REG_STATUS:
+        value = ct3d->memsim_atomic_status;
+        break;
+    case CXL_T3_MEMSIM_REG_OP:
+        value = ct3d->memsim_atomic_op;
+        break;
+    case CXL_T3_MEMSIM_REG_SERVER_STATUS:
+        value = ct3d->memsim_atomic_server_status;
+        break;
+    case CXL_T3_MEMSIM_REG_ADDR:
+        value = ct3d->memsim_atomic_addr;
+        break;
+    case CXL_T3_MEMSIM_REG_VALUE:
+        value = ct3d->memsim_atomic_value;
+        break;
+    case CXL_T3_MEMSIM_REG_EXPECTED:
+        value = ct3d->memsim_atomic_expected;
+        break;
+    case CXL_T3_MEMSIM_REG_OLD_VALUE:
+        value = ct3d->memsim_atomic_old_value;
+        break;
+    default:
+        value = 0;
+        break;
     }
-    /* Return 0 if CAS succeeded (old_value == expected) */
-    return (ret == 0 && resp.old_value == expected) ? 0 : 1;
+    qemu_mutex_unlock(&ct3d->memsim_atomic_lock);
+
+    return value;
 }
 
-/* Memory fence operation */
-static void __attribute__((unused))
-cxl_memsim_fence(void) {
-    CXLMemSimResponse resp = {0};
-    cxl_memsim_request_ext(CXL_OP_FENCE, 0, 0, NULL, 0, 0, &resp);
+static void cxl_type3_memsim_atomic_write(void *opaque, hwaddr offset,
+                                          uint64_t value, unsigned size)
+{
+    CXLType3Dev *ct3d = opaque;
+
+    (void)size;
+
+    qemu_mutex_lock(&ct3d->memsim_atomic_lock);
+    switch (offset) {
+    case CXL_T3_MEMSIM_REG_OP:
+        ct3d->memsim_atomic_op = value;
+        break;
+    case CXL_T3_MEMSIM_REG_ADDR:
+        ct3d->memsim_atomic_addr = value;
+        break;
+    case CXL_T3_MEMSIM_REG_VALUE:
+        ct3d->memsim_atomic_value = value;
+        break;
+    case CXL_T3_MEMSIM_REG_EXPECTED:
+        ct3d->memsim_atomic_expected = value;
+        break;
+    case CXL_T3_MEMSIM_REG_DOORBELL:
+        if (value == 0) {
+            ct3d->memsim_atomic_status = CXL_T3_MEMSIM_STATUS_IDLE;
+        } else if (value == 1) {
+            cxl_type3_memsim_atomic_execute(ct3d);
+        }
+        break;
+    default:
+        break;
+    }
+    qemu_mutex_unlock(&ct3d->memsim_atomic_lock);
+}
+
+static const MemoryRegionOps cxl_type3_memsim_atomic_ops = {
+    .read = cxl_type3_memsim_atomic_read,
+    .write = cxl_type3_memsim_atomic_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+        .unaligned = false,
+    },
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+        .unaligned = false,
+    },
+};
+
+static void cxl_type3_memsim_atomic_bar_init(CXLType3Dev *ct3d)
+{
+    PCIDevice *pdev = PCI_DEVICE(ct3d);
+
+    qemu_mutex_init(&ct3d->memsim_atomic_lock);
+    ct3d->memsim_atomic_status = CXL_T3_MEMSIM_STATUS_IDLE;
+    memory_region_init_io(&ct3d->memsim_atomic_bar, OBJECT(ct3d),
+                          &cxl_type3_memsim_atomic_ops, ct3d,
+                          "cxl-type3-memsim-atomics",
+                          CXL_T3_MEMSIM_ATOMIC_BAR_SIZE);
+    pci_register_bar(pdev, CXL_T3_MEMSIM_ATOMIC_BAR_IDX,
+                     PCI_BASE_ADDRESS_SPACE_MEMORY,
+                     &ct3d->memsim_atomic_bar);
 }
 
 MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
@@ -2550,6 +2705,14 @@ static void ct3d_reset(DeviceState *dev)
                                        CXL2_TYPE3_DEVICE, false);
     cxl_device_register_init_t3(ct3d, CXL_T3_MSIX_MBOX);
 
+    ct3d->memsim_atomic_status = CXL_T3_MEMSIM_STATUS_IDLE;
+    ct3d->memsim_atomic_op = CXL_T3_MEMSIM_OP_NONE;
+    ct3d->memsim_atomic_server_status = 0;
+    ct3d->memsim_atomic_addr = 0;
+    ct3d->memsim_atomic_value = 0;
+    ct3d->memsim_atomic_expected = 0;
+    ct3d->memsim_atomic_old_value = 0;
+
     /*
      * Bring up an endpoint to target with MCTP over VDM.
      * This device is emulating an MLD with single LD for now.
@@ -2577,6 +2740,7 @@ static const Property ct3_props[] = {
     DEFINE_PROP_LINK("lsa", CXLType3Dev, lsa, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *),
     DEFINE_PROP_UINT64("sn", CXLType3Dev, sn, UI64_NULL),
+    DEFINE_PROP_BOOL("memsim-atomics", CXLType3Dev, memsim_atomics, true),
     DEFINE_PROP_STRING("cdat", CXLType3Dev, cxl_cstate.cdat.filename),
     DEFINE_PROP_UINT8("num-dc-regions", CXLType3Dev, dc.num_regions, 0),
     DEFINE_PROP_LINK("volatile-dc-memdev", CXLType3Dev, dc.host_dc,

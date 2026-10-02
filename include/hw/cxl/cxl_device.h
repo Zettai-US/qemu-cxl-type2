@@ -589,6 +589,7 @@ struct CXLType3Dev {
     HostMemoryBackend *hostpmem;
     HostMemoryBackend *lsa;
     uint64_t sn;
+    bool memsim_atomics;
 
     /* State */
     AddressSpace hostvmem_as;
@@ -599,6 +600,17 @@ struct CXLType3Dev {
     /* Always initialized as no way to know if a VDM might show up */
     CXLCCI vdm_fm_owned_ld_mctp_cci;
     CXLCCI ld0_cci;
+
+    /* Experimental BAR used for explicit CXLMemSim atomic commands. */
+    MemoryRegion memsim_atomic_bar;
+    QemuMutex memsim_atomic_lock;
+    uint32_t memsim_atomic_status;
+    uint32_t memsim_atomic_op;
+    uint32_t memsim_atomic_server_status;
+    uint64_t memsim_atomic_addr;
+    uint64_t memsim_atomic_value;
+    uint64_t memsim_atomic_expected;
+    uint64_t memsim_atomic_old_value;
 
     CXLAlertConfig alert_config;
 
