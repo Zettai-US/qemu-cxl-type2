@@ -124,6 +124,15 @@ typedef struct HetGPUSimAlloc {
     struct HetGPUSimAlloc *next;
 } HetGPUSimAlloc;
 
+/* Imported NVSHMEM views. Tokens are endpoint-local and never reused. */
+typedef struct HetGPUIPCMapping {
+    uint64_t token, base, offset, size, generation;
+    uint32_t owner;
+    unsigned char handle[64];
+    struct HetGPUIPCAllocation *allocation;
+    struct HetGPUIPCMapping *next;
+} HetGPUIPCMapping;
+
 /* hetGPU State for CXL Type 2 integration */
 typedef struct HetGPUState {
     bool initialized;
@@ -144,6 +153,9 @@ typedef struct HetGPUState {
     /* Simulation memory tracking */
     HetGPUSimAlloc *sim_allocs;
     uint64_t sim_next_ptr;
+    HetGPUIPCMapping *ipc_mappings;
+    uint64_t ipc_next_token;
+    uint64_t ipc_copy_ops, ipc_copy_bytes;
 
     /* Loaded modules */
     HetGPUModule *modules;
@@ -248,6 +260,16 @@ HetGPUError hetgpu_malloc(HetGPUState *state, size_t size,
  * Returns: HETGPU_SUCCESS on success
  */
 HetGPUError hetgpu_free(HetGPUState *state, HetGPUDevicePtr dev_ptr);
+
+/* v1 wire descriptor: LE u32 version/owner, LE u64 generation/offset/size/
+ * allocation_size, then 64 opaque CUDA IPC bytes (104 bytes total).
+ * Exporter keeps the allocation alive until all endpoints acknowledge close. */
+HetGPUError hetgpu_ipc_import(HetGPUState *state, const uint8_t *wire,
+                             size_t bytes, uint64_t *token);
+HetGPUError hetgpu_ipc_close(HetGPUState *state, uint64_t token);
+HetGPUError hetgpu_ipc_copy(HetGPUState *state, uint64_t token,
+                           uint64_t offset, uint64_t local, uint64_t size,
+                           bool to_remote);
 
 /**
  * hetgpu_memcpy_htod - Copy memory from host to device
@@ -411,6 +433,12 @@ HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
  *
  * Returns: HETGPU_SUCCESS on success
  */
+/* Fixed-slot BAR launch ABI supports scalar/pointer parameters up to 8 bytes. */
+HetGPUError hetgpu_event_op(HetGPUState *state, unsigned op, void **event,
+                             void *end, unsigned flags, float *elapsed);
+int hetgpu_function_params(HetGPUState *state, HetGPUFunction function,
+                           uint64_t *sizes, size_t capacity);
+
 HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,
                                  const HetGPULaunchConfig *config,
                                  void **args, size_t num_args);

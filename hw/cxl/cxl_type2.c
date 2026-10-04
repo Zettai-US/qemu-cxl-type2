@@ -228,19 +228,9 @@ void cxl_type2_cache_writeback(CXLType2State *ct2d, uint64_t addr)
 static bool cxl_type2_cache_fill_line(CXLType2State *ct2d, uint64_t cache_line_addr,
                                       uint8_t cache_data[64])
 {
-    HetGPUState *hetgpu = &ct2d->gpu_info.hetgpu_state;
     uint8_t *mem_ptr;
 
     memset(cache_data, 0, 64);
-
-    if (hetgpu->initialized) {
-        HetGPUError err;
-
-        err = hetgpu_memcpy_dtoh(hetgpu, cache_data, cache_line_addr, 64);
-        if (err == HETGPU_SUCCESS) {
-            return true;
-        }
-    }
 
     mem_ptr = memory_region_get_ram_ptr(&ct2d->device_mem);
     if (mem_ptr && cache_line_addr < ct2d->device_mem_size) {
@@ -2292,6 +2282,9 @@ static void cxl_type2_fabric_features_cleanup(CXLType2State *ct2d)
 /* First-fit allocator from free list, page-aligned (4KB) */
 static int64_t cxl_coherent_pool_alloc(CXLType2State *ct2d, uint64_t size)
 {
+    if (!size || size > ct2d->coherent_pool.size || size > UINT64_MAX - 0xFFF) {
+        return -1;
+    }
     uint64_t aligned_size = (size + 0xFFF) & ~0xFFFULL; /* 4KB page align */
     CXLCohFreeBlock **prev = &ct2d->coherent_pool.free_list;
     CXLCohFreeBlock *blk = ct2d->coherent_pool.free_list;
@@ -2514,6 +2507,38 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
+    case CXL_GPU_CMD_IPC_IMPORT:
+        size = ct2d->gpu_cmd.params[0];
+        if (size != 104 || size > ct2d->gpu_cmd.data_size ||
+            hetgpu_ipc_import(hetgpu, ct2d->gpu_cmd.data, size,
+                               &ct2d->gpu_cmd.results[0]) != HETGPU_SUCCESS) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+        }
+        break;
+
+    case CXL_GPU_CMD_IPC_CLOSE:
+        if (hetgpu_ipc_close(hetgpu, ct2d->gpu_cmd.params[0]) != HETGPU_SUCCESS) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+        }
+        break;
+
+    case CXL_GPU_CMD_IPC_COPY:
+        /* token, object offset, endpoint-local GPU address, length, put(1)/get(0) */
+        if (ct2d->gpu_cmd.params[4] > 1 ||
+            hetgpu_ipc_copy(hetgpu, ct2d->gpu_cmd.params[0],
+                            ct2d->gpu_cmd.params[1], ct2d->gpu_cmd.params[2],
+                            ct2d->gpu_cmd.params[3], ct2d->gpu_cmd.params[4]) != HETGPU_SUCCESS) {
+            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+        } else {
+            cxl_type2_charge_bulk(ct2d, ct2d->gpu_cmd.params[3], ct2d->gpu_cmd.params[4]);
+        }
+        break;
+
+    case CXL_GPU_CMD_IPC_STATS:
+        ct2d->gpu_cmd.results[0] = hetgpu->ipc_copy_ops;
+        ct2d->gpu_cmd.results[1] = hetgpu->ipc_copy_bytes;
+        break;
+
     case CXL_GPU_CMD_MEM_ALLOC:
         size = ct2d->gpu_cmd.params[0];
         if (hetgpu->initialized) {
@@ -2548,49 +2573,49 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     case CXL_GPU_CMD_MEM_COPY_HTOD:
-        dev_ptr = ct2d->gpu_cmd.params[0];  /* dst device ptr */
-        size = ct2d->gpu_cmd.params[1];     /* size */
-        /* Data is in ct2d->gpu_cmd.data buffer */
-        if (size > ct2d->gpu_cmd.data_size) {
-            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
-            break;
-        }
-        cxl_type2_charge_bulk(ct2d, size, true); /* push through the link */
-        if (hetgpu->initialized) {
-            err = hetgpu_memcpy_htod(hetgpu, dev_ptr, ct2d->gpu_cmd.data, size);
-            if (err != HETGPU_SUCCESS) {
+    case CXL_GPU_CMD_MEM_COPY_DTOH:
+        {
+            bool write = cmd == CXL_GPU_CMD_MEM_COPY_HTOD;
+            dev_ptr = ct2d->gpu_cmd.params[0];
+            size = ct2d->gpu_cmd.params[1];
+            if (size > ct2d->gpu_cmd.data_size || size > UINT64_MAX - dev_ptr) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
                 break;
             }
-            /* Also update shadow copy in device_mem for coherency tracking */
-            if (dev_ptr + size <= ct2d->device_mem_size &&
-                cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
-                                                true, false)) {
-                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem) {
-                    memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
-                    cxl_type2_invalidate_shadow_range(ct2d, dev_ptr, size);
-                    /* Notify BAR coherency layer of GPU write */
-                    if (ct2d->bar_coherency.enabled) {
-                        cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
-                                                   dev_ptr, size, true);
-                    }
-                }
+            if (!size) {
+                break;
             }
-        } else {
-            /* Fallback: copy to device memory region */
-            if (dev_ptr + size <= ct2d->device_mem_size &&
-                cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
-                                                true, false)) {
+            /* BAR4 offsets and CUDA virtual addresses are distinct namespaces.
+             * Legacy pointer-rich programs pass BAR4 offsets to these copies.
+             * Never forward those offsets to the native CUDA driver. */
+            if (dev_ptr < ct2d->device_mem_size) {
                 uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem) {
+                if (!mem || size > ct2d->device_mem_size - dev_ptr ||
+                    !cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
+                                                    write, false)) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                cxl_type2_charge_bulk(ct2d, size, write);
+                if (ct2d->bar_coherency.enabled) {
+                    cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
+                                               dev_ptr, size, write);
+                }
+                if (write) {
                     memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
                     cxl_type2_invalidate_shadow_range(ct2d, dev_ptr, size);
-                    /* Notify BAR coherency layer of GPU write */
-                    if (ct2d->bar_coherency.enabled) {
-                        cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
-                                                   dev_ptr, size, true);
-                    }
+                } else {
+                    memcpy(ct2d->gpu_cmd.data, mem + dev_ptr, size);
+                }
+            } else if (hetgpu->initialized) {
+                err = write ? hetgpu_memcpy_htod(hetgpu, dev_ptr,
+                                                 ct2d->gpu_cmd.data, size)
+                            : hetgpu_memcpy_dtoh(hetgpu, ct2d->gpu_cmd.data,
+                                                 dev_ptr, size);
+                if (err != HETGPU_SUCCESS) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                } else {
+                    cxl_type2_charge_bulk(ct2d, size, write);
                 }
             } else {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
@@ -2598,51 +2623,46 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         }
         break;
 
-    case CXL_GPU_CMD_MEM_COPY_DTOH:
-        dev_ptr = ct2d->gpu_cmd.params[0];  /* src device ptr */
-        size = ct2d->gpu_cmd.params[1];     /* size */
-        if (size > ct2d->gpu_cmd.data_size) {
-            ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
-            break;
-        }
-        cxl_type2_charge_bulk(ct2d, size, false); /* device consume */
-        if (hetgpu->initialized) {
-            /* Notify BAR coherency layer before GPU read */
-            if (ct2d->bar_coherency.enabled) {
-                cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
-                                           dev_ptr, size, false);
-            }
-            err = hetgpu_memcpy_dtoh(hetgpu, ct2d->gpu_cmd.data, dev_ptr, size);
-            if (err != HETGPU_SUCCESS) {
+    case CXL_GPU_CMD_EVENT_CREATE:
+        {
+            unsigned id = ct2d->gpu_cmd.num_events;
+            if (id >= 256 || hetgpu_event_op(hetgpu, 0,
+                    &ct2d->gpu_cmd.events[id], NULL, ct2d->gpu_cmd.params[0],
+                    NULL) != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else {
+                ct2d->gpu_cmd.results[0] = id + 1;
+                ct2d->gpu_cmd.num_events++;
+            }
+        }
+        break;
+    case CXL_GPU_CMD_EVENT_DESTROY:
+    case CXL_GPU_CMD_EVENT_RECORD:
+    case CXL_GPU_CMD_EVENT_SYNC:
+    case CXL_GPU_CMD_EVENT_ELAPSED:
+        {
+            uint64_t id = ct2d->gpu_cmd.params[0];
+            uint64_t end = ct2d->gpu_cmd.params[1];
+            bool elapsed = cmd == CXL_GPU_CMD_EVENT_ELAPSED;
+            if (!id || id > ct2d->gpu_cmd.num_events ||
+                !ct2d->gpu_cmd.events[id - 1] ||
+                (elapsed && (!end || end > ct2d->gpu_cmd.num_events ||
+                             !ct2d->gpu_cmd.events[end - 1]))) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_HANDLE;
                 break;
             }
-            /* Update shadow copy from GPU for coherency */
-            if (dev_ptr + size <= ct2d->device_mem_size &&
-                cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
-                                                false, false)) {
-                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem) {
-                    memcpy(mem + dev_ptr, ct2d->gpu_cmd.data, size);
-                    cxl_type2_invalidate_shadow_range(ct2d, dev_ptr, size);
-                }
-            }
-        } else {
-            /* Fallback: copy from device memory region */
-            if (dev_ptr + size <= ct2d->device_mem_size &&
-                cxl_type2_fabric_access_allowed(ct2d, dev_ptr, size,
-                                                false, false)) {
-                uint8_t *mem = memory_region_get_ram_ptr(&ct2d->device_mem);
-                if (mem) {
-                    /* Notify BAR coherency layer before GPU read */
-                    if (ct2d->bar_coherency.enabled) {
-                        cxl_bar_notify_gpu_access(&ct2d->bar_coherency,
-                                                   dev_ptr, size, false);
-                    }
-                    memcpy(ct2d->gpu_cmd.data, mem + dev_ptr, size);
-                }
-            } else {
+            float milliseconds = 0;
+            err = hetgpu_event_op(hetgpu, cmd - CXL_GPU_CMD_EVENT_CREATE,
+                &ct2d->gpu_cmd.events[id - 1],
+                elapsed ? ct2d->gpu_cmd.events[end - 1] : NULL, 0, &milliseconds);
+            if (err != HETGPU_SUCCESS) {
                 ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+            } else if (cmd == CXL_GPU_CMD_EVENT_DESTROY) {
+                ct2d->gpu_cmd.events[id - 1] = NULL;
+            } else if (elapsed) {
+                uint32_t bits;
+                memcpy(&bits, &milliseconds, sizeof(bits));
+                ct2d->gpu_cmd.results[0] = bits;
             }
         }
         break;
@@ -2678,6 +2698,12 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 if (err == HETGPU_SUCCESS) {
                     ct2d->gpu_cmd.functions[ct2d->gpu_cmd.num_functions] = func;
                     ct2d->gpu_cmd.results[0] = ct2d->gpu_cmd.num_functions;
+                    uint64_t sizes[64] = {0};
+                    int count = hetgpu_function_params(hetgpu, func, sizes, 64);
+                    ct2d->gpu_cmd.results[1] = count < 0 ? UINT64_MAX : count;
+                    for (int i = 0; i < count; ++i) {
+                        stq_le_p(ct2d->gpu_cmd.data + i * 8, sizes[i]);
+                    }
                     ct2d->gpu_cmd.num_functions++;
                 } else {
                     ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_NOT_FOUND;
@@ -2704,9 +2730,20 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
                 config.shared_mem_bytes = ct2d->gpu_cmd.params[4] & 0xFFFFFFFF;
                 config.stream = NULL;
 
-                /* Kernel args are in data buffer as array of pointers */
-                uint32_t num_args = (ct2d->gpu_cmd.params[4] >> 32) & 0xFF;
-                void **args = (void **)ct2d->gpu_cmd.data;
+                /* Wire slots hold values, never host pointers supplied by a guest. */
+                uint64_t num_args = ct2d->gpu_cmd.params[4] >> 32;
+                uint64_t sizes[64], values[64];
+                void *args[64];
+                int expected = hetgpu_function_params(hetgpu,
+                    ct2d->gpu_cmd.functions[func_id], sizes, 64);
+                if (num_args > 64 || expected < 0 || num_args != expected) {
+                    ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                    break;
+                }
+                for (size_t i = 0; i < num_args; ++i) {
+                    values[i] = ldq_le_p(ct2d->gpu_cmd.data + i * 8);
+                    args[i] = &values[i];
+                }
 
                 err = hetgpu_launch_kernel(hetgpu,
                                            ct2d->gpu_cmd.functions[func_id],
@@ -2969,6 +3006,26 @@ static void cxl_type2_gpu_execute_cmd(CXLType2State *ct2d, uint32_t cmd)
         break;
 
     /* ---- Coherent shared memory pool commands ---- */
+    case CXL_GPU_CMD_ATOMIC_FETCH_ADD64:
+        {
+            uint64_t offset = ct2d->gpu_cmd.params[0];
+            /* One serialized MMIO command is indivisible across guest vCPUs.
+             * Native LOCK instructions can split into separate KVM MMIO exits.
+             * No distributed atomicity is promised for an external server. */
+            if ((offset & 7) || ct2d->memsim.connected ||
+                offset > ct2d->device_mem_size ||
+                ct2d->device_mem_size - offset < 8 ||
+                !cxl_type2_fabric_access_allowed(ct2d, offset, 8, true, true)) {
+                ct2d->gpu_cmd.cmd_result = CXL_GPU_ERROR_INVALID_VALUE;
+                break;
+            }
+            uint64_t old = cxl_type2_coherent_mem_read(ct2d, offset, 8);
+            cxl_type2_coherent_mem_write(ct2d, offset,
+                                          old + ct2d->gpu_cmd.params[1], 8);
+            ct2d->gpu_cmd.results[0] = old;
+        }
+        break;
+
     case CXL_GPU_CMD_COHERENT_ALLOC:
         {
             uint64_t alloc_size = ct2d->gpu_cmd.params[0];

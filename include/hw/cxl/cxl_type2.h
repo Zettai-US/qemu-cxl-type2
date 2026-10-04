@@ -208,6 +208,8 @@ typedef struct CXLType2State {
         void    *functions[256];       /* Kernel function handles */
         uint32_t num_modules;
         uint32_t num_functions;
+        void *events[256];
+        uint32_t num_events;
         uint32_t capabilities;         /* Device capabilities (bulk transfer, etc.) */
     } gpu_cmd;
 

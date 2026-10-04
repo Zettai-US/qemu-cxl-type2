@@ -11,6 +11,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "qemu/thread.h"
+#include "qemu/bswap.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include <dlfcn.h>
 
@@ -53,8 +54,21 @@ typedef int (*cuMemFree_fn)(uint64_t);
 typedef int (*cuMemcpyHtoD_fn)(uint64_t, const void *, size_t);
 typedef int (*cuMemcpyDtoH_fn)(void *, uint64_t, size_t);
 typedef int (*cuMemcpyDtoD_fn)(uint64_t, uint64_t, size_t);
+typedef struct { unsigned char bytes[64]; } HetGPUCudaIPCHandle;
+typedef int (*cuIpcOpenMemHandle_fn)(uint64_t *, HetGPUCudaIPCHandle, unsigned int);
+typedef int (*cuIpcCloseMemHandle_fn)(uint64_t);
+typedef int (*cuMemGetAddressRange_fn)(uint64_t *, size_t *, uint64_t);
+typedef int (*cuDevicePrimaryCtxRetain_fn)(void **, int);
+typedef int (*cuDevicePrimaryCtxRelease_fn)(int);
+typedef int (*cuMemcpyPeer_fn)(uint64_t, void *, uint64_t, void *, size_t);
 typedef int (*cuModuleLoadData_fn)(void **, const void *);
+typedef int (*cuFuncGetParamInfo_fn)(void *, size_t, size_t *, size_t *);
 typedef int (*cuModuleGetFunction_fn)(void **, void *, const char *);
+typedef int (*cuEventCreate_fn)(void **, unsigned int);
+typedef int (*cuEventDestroy_fn)(void *);
+typedef int (*cuEventRecord_fn)(void *, void *);
+typedef int (*cuEventSynchronize_fn)(void *);
+typedef int (*cuEventElapsedTime_fn)(float *, void *, void *);
 typedef int (*cuLaunchKernel_fn)(void *, unsigned int, unsigned int, unsigned int,
                                   unsigned int, unsigned int, unsigned int,
                                   unsigned int, void *, void **, void **);
@@ -92,9 +106,22 @@ static struct {
     cuMemcpyHtoD_fn cuMemcpyHtoD;
     cuMemcpyDtoH_fn cuMemcpyDtoH;
     cuMemcpyDtoD_fn cuMemcpyDtoD;
+    cuIpcOpenMemHandle_fn cuIpcOpenMemHandle;
+    cuIpcCloseMemHandle_fn cuIpcCloseMemHandle;
+    cuMemGetAddressRange_fn cuMemGetAddressRange;
+    cuDevicePrimaryCtxRetain_fn cuDevicePrimaryCtxRetain;
+    cuDevicePrimaryCtxRelease_fn cuDevicePrimaryCtxRelease;
+    cuMemcpyPeer_fn cuMemcpyPeer;
     cuModuleLoadData_fn cuModuleLoadData;
     cuModuleGetFunction_fn cuModuleGetFunction;
+    cuFuncGetParamInfo_fn cuFuncGetParamInfo;
     cuLaunchKernel_fn cuLaunchKernel;
+    cuEventCreate_fn cuEventCreate;
+    cuEventDestroy_fn cuEventDestroy;
+    cuEventRecord_fn cuEventRecord;
+    cuEventSynchronize_fn cuEventSynchronize;
+    cuEventElapsedTime_fn cuEventElapsedTime;
+
     cuCtxPushCurrent_fn cuCtxPushCurrent;
     cuCtxPopCurrent_fn cuCtxPopCurrent;
     cuCtxSetCurrent_fn cuCtxSetCurrent;
@@ -108,6 +135,20 @@ static QemuMutex g_cuda_mutex;
 static bool g_cuda_mutex_initialized = false;
 static bool g_cuda_lib_initialized = false;
 static void *g_cuda_lib_handle = NULL;
+
+/* IPC permits one importing context/device/producer process. Share imports in
+ * a retained primary context, then copy to each endpoint's private context.
+ * The global CUDA mutex protects this cache and its reference counts. */
+typedef struct HetGPUIPCAllocation {
+    uint64_t base;
+    size_t size;
+    int device;
+    unsigned refs;
+    void *context;
+    unsigned char handle[64];
+    struct HetGPUIPCAllocation *next;
+} HetGPUIPCAllocation;
+static HetGPUIPCAllocation *g_ipc_allocations;
 
 static void ensure_cuda_mutex_init(void)
 {
@@ -184,8 +225,20 @@ HetGPUError hetgpu_init(HetGPUState *state, HetGPUBackendType backend,
             g_cuda_funcs.cuMemcpyHtoD = dlsym(g_cuda_lib_handle, "cuMemcpyHtoD_v2");
             g_cuda_funcs.cuMemcpyDtoH = dlsym(g_cuda_lib_handle, "cuMemcpyDtoH_v2");
             g_cuda_funcs.cuMemcpyDtoD = dlsym(g_cuda_lib_handle, "cuMemcpyDtoD_v2");
+            g_cuda_funcs.cuIpcOpenMemHandle = dlsym(g_cuda_lib_handle, "cuIpcOpenMemHandle_v2");
+            g_cuda_funcs.cuIpcCloseMemHandle = dlsym(g_cuda_lib_handle, "cuIpcCloseMemHandle");
+            g_cuda_funcs.cuMemGetAddressRange = dlsym(g_cuda_lib_handle, "cuMemGetAddressRange_v2");
+            g_cuda_funcs.cuDevicePrimaryCtxRetain = dlsym(g_cuda_lib_handle, "cuDevicePrimaryCtxRetain");
+            g_cuda_funcs.cuDevicePrimaryCtxRelease = dlsym(g_cuda_lib_handle, "cuDevicePrimaryCtxRelease_v2");
+            g_cuda_funcs.cuMemcpyPeer = dlsym(g_cuda_lib_handle, "cuMemcpyPeer");
             g_cuda_funcs.cuModuleLoadData = dlsym(g_cuda_lib_handle, "cuModuleLoadData");
             g_cuda_funcs.cuModuleGetFunction = dlsym(g_cuda_lib_handle, "cuModuleGetFunction");
+            g_cuda_funcs.cuFuncGetParamInfo = dlsym(g_cuda_lib_handle, "cuFuncGetParamInfo");
+            g_cuda_funcs.cuEventCreate = dlsym(g_cuda_lib_handle, "cuEventCreate");
+            g_cuda_funcs.cuEventDestroy = dlsym(g_cuda_lib_handle, "cuEventDestroy_v2");
+            g_cuda_funcs.cuEventRecord = dlsym(g_cuda_lib_handle, "cuEventRecord");
+            g_cuda_funcs.cuEventSynchronize = dlsym(g_cuda_lib_handle, "cuEventSynchronize");
+            g_cuda_funcs.cuEventElapsedTime = dlsym(g_cuda_lib_handle, "cuEventElapsedTime");
             g_cuda_funcs.cuLaunchKernel = dlsym(g_cuda_lib_handle, "cuLaunchKernel");
             g_cuda_funcs.cuCtxPushCurrent = dlsym(g_cuda_lib_handle, "cuCtxPushCurrent_v2");
             g_cuda_funcs.cuCtxPopCurrent = dlsym(g_cuda_lib_handle, "cuCtxPopCurrent_v2");
@@ -385,6 +438,18 @@ void hetgpu_cleanup(HetGPUState *state)
 {
     if (!state) {
         return;
+    }
+
+    while (state->ipc_mappings) {
+        if (hetgpu_ipc_close(state, state->ipc_mappings->token) != HETGPU_SUCCESS) {
+            /* Context destruction releases remaining driver mappings. */
+            while (state->ipc_mappings) {
+                HetGPUIPCMapping *next = state->ipc_mappings->next;
+                g_free(state->ipc_mappings);
+                state->ipc_mappings = next;
+            }
+            break;
+        }
     }
 
     /* Free simulation allocations */
@@ -615,6 +680,194 @@ HetGPUError hetgpu_synchronize(HetGPUState *state)
     return HETGPU_SUCCESS;
 }
 
+HetGPUError hetgpu_ipc_import(HetGPUState *state, const uint8_t *wire,
+                             size_t bytes, uint64_t *token)
+{
+    uint64_t offset, size, allocation_size, base = 0, actual_base = 0;
+    size_t actual_size = 0;
+    bool opened = false, retained = false;
+    void *context = NULL;
+    HetGPUIPCAllocation *allocation = NULL;
+    HetGPUCudaIPCHandle handle;
+    int err = 0;
+
+    if (!state || !state->initialized || state->backend != HETGPU_BACKEND_NVIDIA ||
+        !wire || !token || bytes != 104 || ldl_le_p(wire) != 1 ||
+        !ldq_le_p(wire + 8) || !g_cuda_funcs.cuIpcOpenMemHandle ||
+        !g_cuda_funcs.cuIpcCloseMemHandle || !g_cuda_funcs.cuMemGetAddressRange ||
+        !g_cuda_funcs.cuCtxSynchronize || !g_cuda_funcs.cuMemcpyPeer ||
+        !g_cuda_funcs.cuDevicePrimaryCtxRetain || !g_cuda_funcs.cuDevicePrimaryCtxRelease ||
+        !g_cuda_funcs.cuCtxSetCurrent ||
+        state->ipc_next_token == UINT64_MAX) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    offset = ldq_le_p(wire + 16);
+    size = ldq_le_p(wire + 24);
+    allocation_size = ldq_le_p(wire + 32);
+    if (!size || offset > allocation_size || size > allocation_size - offset) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    memcpy(handle.bytes, wire + 40, 64);
+    cuda_lock(state);
+    /* Share one import across all logical endpoints and object views. */
+    for (HetGPUIPCAllocation *a = g_ipc_allocations; a; a = a->next) {
+        if (a->device == state->cuda_device && !memcmp(a->handle, handle.bytes, 64)) {
+            allocation = a;
+            base = a->base;
+            context = a->context;
+            actual_base = base;
+            actual_size = a->size;
+            break;
+        }
+    }
+    if (!base) {
+        err = g_cuda_funcs.cuDevicePrimaryCtxRetain(&context, state->cuda_device);
+        retained = !err;
+        if (!err) {
+            err = g_cuda_funcs.cuCtxSetCurrent(context);
+        }
+        if (!err) {
+            err = g_cuda_funcs.cuIpcOpenMemHandle(&base, handle, 1);
+            opened = !err;
+        }
+        if (!err) {
+            err = g_cuda_funcs.cuMemGetAddressRange(&actual_base, &actual_size, base);
+        }
+    }
+    if (err || actual_base != base || allocation_size > actual_size) {
+        if (opened) {
+            g_cuda_funcs.cuIpcCloseMemHandle(base);
+        }
+        g_cuda_funcs.cuCtxSetCurrent(state->context);
+        if (retained) {
+            g_cuda_funcs.cuDevicePrimaryCtxRelease(state->cuda_device);
+        }
+        cuda_unlock(state);
+        qemu_log("CXL IPC import failed: driver=%d\n", err);
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    if (!allocation) {
+        allocation = g_new0(HetGPUIPCAllocation, 1);
+        allocation->base = base;
+        allocation->size = actual_size;
+        allocation->device = state->cuda_device;
+        allocation->context = context;
+        memcpy(allocation->handle, handle.bytes, 64);
+        allocation->next = g_ipc_allocations;
+        g_ipc_allocations = allocation;
+    }
+    allocation->refs++;
+    g_cuda_funcs.cuCtxSetCurrent(state->context);
+    HetGPUIPCMapping *m = g_new0(HetGPUIPCMapping, 1);
+    m->base = base;
+    m->allocation = allocation;
+    m->offset = offset;
+    m->size = size;
+    m->owner = ldl_le_p(wire + 4);
+    m->generation = ldq_le_p(wire + 8);
+    m->token = ++state->ipc_next_token;
+    memcpy(m->handle, handle.bytes, 64);
+    m->next = state->ipc_mappings;
+    state->ipc_mappings = m;
+    *token = m->token;
+    cuda_unlock(state);
+    return HETGPU_SUCCESS;
+}
+
+HetGPUError hetgpu_ipc_close(HetGPUState *state, uint64_t token)
+{
+    if (!state || !state->initialized || !token) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    cuda_lock(state);
+    HetGPUIPCMapping **link = &state->ipc_mappings;
+    while (*link && (*link)->token != token) {
+        link = &(*link)->next;
+    }
+    if (!*link) {
+        cuda_unlock(state);
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    HetGPUIPCMapping *m = *link;
+    HetGPUIPCAllocation *allocation = m->allocation;
+    int err = g_cuda_funcs.cuCtxSynchronize();
+    if (!err && allocation->refs == 1) {
+        err = g_cuda_funcs.cuCtxSetCurrent(allocation->context);
+        if (!err) {
+            err = g_cuda_funcs.cuCtxSynchronize();
+        }
+        if (!err) {
+            err = g_cuda_funcs.cuIpcCloseMemHandle(m->base);
+        }
+        g_cuda_funcs.cuCtxSetCurrent(state->context);
+    }
+    if (!err) {
+        if (--allocation->refs == 0) {
+            HetGPUIPCAllocation **a = &g_ipc_allocations;
+            while (*a != allocation) {
+                a = &(*a)->next;
+            }
+            *a = allocation->next;
+            g_cuda_funcs.cuDevicePrimaryCtxRelease(allocation->device);
+            g_free(allocation);
+        }
+        *link = m->next;
+        g_free(m);
+    }
+    cuda_unlock(state);
+    return err ? HETGPU_ERROR_UNKNOWN : HETGPU_SUCCESS;
+}
+
+HetGPUError hetgpu_ipc_copy(HetGPUState *state, uint64_t token,
+                           uint64_t offset, uint64_t local, uint64_t size,
+                           bool to_remote)
+{
+    if (!state || !state->initialized || !token) {
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    cuda_lock(state);
+    HetGPUIPCMapping *m = state->ipc_mappings;
+    while (m && m->token != token) {
+        m = m->next;
+    }
+    if (!m || offset > m->size || size > m->size - offset) {
+        cuda_unlock(state);
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    uint64_t base = 0;
+    size_t allocation_size = 0;
+    int err = g_cuda_funcs.cuMemGetAddressRange(&base, &allocation_size, local);
+    if (err || local < base || local - base > allocation_size ||
+        size > allocation_size - (local - base)) {
+        cuda_unlock(state);
+        return HETGPU_ERROR_INVALID_VALUE;
+    }
+    uint64_t remote = m->base + m->offset + offset;
+    err = g_cuda_funcs.cuCtxSynchronize();
+    if (!err && size) {
+        err = g_cuda_funcs.cuMemcpyPeer(to_remote ? remote : local,
+                                        to_remote ? m->allocation->context : state->context,
+                                        to_remote ? local : remote,
+                                        to_remote ? state->context : m->allocation->context, size);
+    }
+    if (!err) {
+        err = g_cuda_funcs.cuCtxSynchronize();
+    }
+    if (!err) {
+        err = g_cuda_funcs.cuCtxSetCurrent(m->allocation->context);
+        if (!err) {
+            err = g_cuda_funcs.cuCtxSynchronize();
+        }
+        g_cuda_funcs.cuCtxSetCurrent(state->context);
+    }
+    if (!err) {
+        state->ipc_copy_ops++;
+        state->ipc_copy_bytes += size;
+    }
+    cuda_unlock(state);
+    return err ? HETGPU_ERROR_UNKNOWN : HETGPU_SUCCESS;
+}
+
 HetGPUError hetgpu_malloc(HetGPUState *state, size_t size,
                           HetGPUMemFlags flags, HetGPUDevicePtr *dev_ptr)
 {
@@ -729,6 +982,19 @@ HetGPUError hetgpu_free(HetGPUState *state, HetGPUDevicePtr dev_ptr)
     return HETGPU_SUCCESS;
 }
 
+/* Caller holds the CUDA lock and has selected the endpoint context. */
+static bool cuda_copy_range_valid(HetGPUDevicePtr ptr, size_t size)
+{
+    uint64_t base = 0;
+    size_t extent = 0;
+    if (!g_cuda_funcs.cuMemGetAddressRange ||
+        g_cuda_funcs.cuMemGetAddressRange(&base, &extent, ptr) != 0) {
+        return false;
+    }
+    return ptr >= base && ptr - base <= extent &&
+           size <= extent - (ptr - base);
+}
+
 HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
                                const void *src, size_t size)
 {
@@ -741,6 +1007,10 @@ HetGPUError hetgpu_memcpy_htod(HetGPUState *state, HetGPUDevicePtr dst,
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuMemcpyHtoD && state->backend != HETGPU_BACKEND_SIMULATION) {
         cuda_lock(state);
+        if (!cuda_copy_range_valid(dst, size)) {
+            cuda_unlock(state);
+            return HETGPU_ERROR_INVALID_VALUE;
+        }
         int err = g_cuda_funcs.cuMemcpyHtoD(dst, src, size);
         cuda_unlock(state);
 
@@ -788,6 +1058,10 @@ HetGPUError hetgpu_memcpy_dtoh(HetGPUState *state, void *dst,
     /* For hetGPU managed mode, use real GPU through hetGPU library */
     if (g_cuda_funcs.cuMemcpyDtoH && state->backend != HETGPU_BACKEND_SIMULATION) {
         cuda_lock(state);
+        if (!cuda_copy_range_valid(src, size)) {
+            cuda_unlock(state);
+            return HETGPU_ERROR_INVALID_VALUE;
+        }
         int err = g_cuda_funcs.cuMemcpyDtoH(dst, src, size);
         cuda_unlock(state);
 
@@ -1104,6 +1378,51 @@ HetGPUError hetgpu_get_function(HetGPUState *state, HetGPUModule module,
     }
 
     return HETGPU_ERROR_NOT_INITIALIZED;
+}
+
+HetGPUError hetgpu_event_op(HetGPUState *state, unsigned op, void **event,
+                             void *end, unsigned flags, float *elapsed)
+{
+    if (!state || !state->initialized || !g_cuda_funcs.cuEventCreate ||
+        !g_cuda_funcs.cuEventDestroy || !g_cuda_funcs.cuEventRecord ||
+        !g_cuda_funcs.cuEventSynchronize || !g_cuda_funcs.cuEventElapsedTime) {
+        return HETGPU_ERROR_NOT_INITIALIZED;
+    }
+    int err = 1;
+    cuda_lock(state);
+    switch (op) {
+    case 0: err = g_cuda_funcs.cuEventCreate(event, flags); break;
+    case 1: err = g_cuda_funcs.cuEventDestroy(*event); break;
+    case 2: err = g_cuda_funcs.cuEventRecord(*event, NULL); break;
+    case 3: err = g_cuda_funcs.cuEventSynchronize(*event); break;
+    case 4: err = g_cuda_funcs.cuEventElapsedTime(elapsed, *event, end); break;
+    }
+    cuda_unlock(state);
+    return err ? HETGPU_ERROR_INVALID_VALUE : HETGPU_SUCCESS;
+}
+
+int hetgpu_function_params(HetGPUState *state, HetGPUFunction function,
+                           uint64_t *sizes, size_t capacity)
+{
+    if (!state || !state->initialized || !function || !g_cuda_funcs.cuFuncGetParamInfo) {
+        return -1;
+    }
+    cuda_lock(state);
+    for (size_t i = 0; i <= capacity; ++i) {
+        size_t offset = 0, size = 0;
+        int err = g_cuda_funcs.cuFuncGetParamInfo(function, i, &offset, &size);
+        if (err == 1) { /* CUDA_ERROR_INVALID_VALUE: index past the last parameter. */
+            cuda_unlock(state);
+            return i;
+        }
+        if (err || i == capacity || !size || size > sizeof(uint64_t)) {
+            cuda_unlock(state);
+            return -1;
+        }
+        sizes[i] = size;
+    }
+    cuda_unlock(state);
+    return -1;
 }
 
 HetGPUError hetgpu_launch_kernel(HetGPUState *state, HetGPUFunction function,

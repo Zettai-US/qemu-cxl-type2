@@ -106,6 +106,10 @@ typedef enum {
     CXL_GPU_CMD_MEM_COPY_DTOD   = 0x24,
     CXL_GPU_CMD_MEM_SET         = 0x25,
     CXL_GPU_CMD_MEM_GET_INFO    = 0x26,
+    CXL_GPU_CMD_IPC_IMPORT      = 0x27,
+    CXL_GPU_CMD_IPC_CLOSE       = 0x28,
+    CXL_GPU_CMD_IPC_COPY        = 0x29,
+    CXL_GPU_CMD_IPC_STATS       = 0x2A,
 
     CXL_GPU_CMD_MODULE_LOAD_PTX = 0x30,
     CXL_GPU_CMD_MODULE_UNLOAD   = 0x31,
@@ -121,6 +125,7 @@ typedef enum {
     CXL_GPU_CMD_EVENT_DESTROY   = 0x61,
     CXL_GPU_CMD_EVENT_RECORD    = 0x62,
     CXL_GPU_CMD_EVENT_SYNC      = 0x63,
+    CXL_GPU_CMD_EVENT_ELAPSED = 0x64, /* event IDs -> float milliseconds bits */
 
     /* Bulk transfer commands (optimized for large transfers) */
     CXL_GPU_CMD_BULK_HTOD       = 0x70,  /* Bulk host-to-device via BAR4 */
@@ -145,6 +150,7 @@ typedef enum {
     CXL_GPU_CMD_SET_BIAS            = 0xA4,  /* Set bias mode for region */
     CXL_GPU_CMD_GET_BIAS            = 0xA5,  /* Get bias mode for address */
     CXL_GPU_CMD_BIAS_FLIP           = 0xA6,  /* Flip bias with cache flush */
+    CXL_GPU_CMD_ATOMIC_FETCH_ADD64 = 0xA7, /* BAR4 offset, addend -> old value */
 
     /* Coherency statistics commands */
     CXL_GPU_CMD_COH_GET_STATS       = 0xB0,  /* Get coherency statistics */
