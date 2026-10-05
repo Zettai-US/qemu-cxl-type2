@@ -35,6 +35,7 @@
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_type3_memsim.h"
 #include "hw/pci/msix.h"
+#include "hw/cxl/zettbridge.h"
 
 /* type3 device private */
 enum CXL_T3_MSIX_VECTOR {
@@ -432,6 +433,20 @@ static void hdm_decoder_commit(CXLType3Dev *ct3d, int which)
     ctrl = FIELD_DP32(ctrl, CXL_HDM_DECODER0_CTRL, COMMITTED, 1);
 
     stl_le_p(cache_mem + R_CXL_HDM_DECODER0_CTRL + which * hdm_inc, ctrl);
+    if (ct3d->zettbridge && which == 0) {
+        uint64_t base = (uint64_t)ldl_le_p(cache_mem +
+                                         R_CXL_HDM_DECODER0_BASE_HI) << 32;
+        uint64_t size = (uint64_t)ldl_le_p(cache_mem +
+                                         R_CXL_HDM_DECODER0_SIZE_HI) << 32;
+        base |= ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_BASE_LO) & 0xf0000000;
+        size |= ldl_le_p(cache_mem + R_CXL_HDM_DECODER0_SIZE_LO) & 0xf0000000;
+        /*
+         * The managed-pool platform uses one non-interleaved decoder.
+         * Actual data translation still uses the standard CXL HDM path.
+         */
+        zettbridge_set_hdm(ct3d->zettbridge, base,
+                          FIELD_EX32(ctrl, CXL_HDM_DECODER0_CTRL, IW) ? 0 : size);
+    }
 }
 
 static void hdm_decoder_uncommit(CXLType3Dev *ct3d, int which)
@@ -447,6 +462,9 @@ static void hdm_decoder_uncommit(CXLType3Dev *ct3d, int which)
     ctrl = FIELD_DP32(ctrl, CXL_HDM_DECODER0_CTRL, COMMITTED, 0);
 
     stl_le_p(cache_mem + R_CXL_HDM_DECODER0_CTRL + which * hdm_inc, ctrl);
+    if (ct3d->zettbridge && which == 0) {
+        zettbridge_set_hdm(ct3d->zettbridge, 0, 0);
+    }
 }
 
 static int ct3d_qmp_uncor_err_to_cxl(CxlUncorErrorType qmp_err)
@@ -892,6 +910,14 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     uint16_t count;
 
     QTAILQ_INIT(&ct3d->error_list);
+
+    if (ct3d->zettbridge && (!ct3d->hostvmem || ct3d->hostpmem ||
+        ct3d->dc.num_regions || !zettbridge_is_consumer(ct3d->zettbridge,
+                                                       ct3d->hostvmem->size))) {
+        error_setg(errp, "zettbridge requires a realized consumer and "
+                         "matching volatile-only capacity");
+        return;
+    }
 
     if (!cxl_setup_memory(ct3d, errp)) {
         return;
@@ -2574,7 +2600,9 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     int res;
     
     /* Initialize CXLMemSim on first use */
-    cxl_memsim_init(ct3d);
+    if (!ct3d->zettbridge) {
+        cxl_memsim_init(ct3d);
+    }
     
     /* Log all CXL Type3 reads */
     //info_report("CXL_TYPE3_READ: host_addr=0x%lx size=%u", 
@@ -2584,6 +2612,10 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
                                       &as, &dpa_offset);
     if (res) {
         return MEMTX_ERROR;
+    }
+
+    if (ct3d->zettbridge) {
+        return zettbridge_access(ct3d->zettbridge, dpa_offset, data, size, false);
     }
 
     if (cxl_dev_media_disabled(&ct3d->cxl_dstate)) {
@@ -2640,7 +2672,9 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     int res;
     
     /* Initialize CXLMemSim on first use */
-    cxl_memsim_init(ct3d);
+    if (!ct3d->zettbridge) {
+        cxl_memsim_init(ct3d);
+    }
     
     /* Log all CXL Type3 writes */
     // info_report("CXL_TYPE3_WRITE: host_addr=0x%lx size=%u data=0x%lx",
@@ -2650,6 +2684,10 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
                                       &as, &dpa_offset);
     if (res) {
         return MEMTX_ERROR;
+    }
+
+    if (ct3d->zettbridge) {
+        return zettbridge_access(ct3d->zettbridge, dpa_offset, &data, size, true);
     }
 
     if (cxl_dev_media_disabled(&ct3d->cxl_dstate)) {
@@ -2731,6 +2769,8 @@ static void ct3d_reset(DeviceState *dev)
 }
 
 static const Property ct3_props[] = {
+    DEFINE_PROP_LINK("zettbridge", CXLType3Dev, zettbridge,
+                     TYPE_ZETTBRIDGE, ZettBridge *),
     DEFINE_PROP_LINK("memdev", CXLType3Dev, hostmem, TYPE_MEMORY_BACKEND,
                      HostMemoryBackend *), /* for backward compatibility */
     DEFINE_PROP_LINK("persistent-memdev", CXLType3Dev, hostpmem,

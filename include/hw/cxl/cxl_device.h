@@ -590,6 +590,7 @@ struct CXLType3Dev {
     HostMemoryBackend *lsa;
     uint64_t sn;
     bool memsim_atomics;
+    struct ZettBridge *zettbridge;
 
     /* State */
     AddressSpace hostvmem_as;
