@@ -710,7 +710,7 @@ static void disconnect_peer(ZettBridge *s)
         close(s->peer);
         s->peer = -1;
     }
-    if (s->ever_attached && s->state != 5) {
+    if ((s->epoch || s->ever_attached) && s->state != 5) {
         fault(s, ZB_DMA_FAULT);
     }
 }
@@ -946,6 +946,11 @@ static void zb_reset(DeviceState *dev)
         /* A reset never authorizes old backing/mapping reuse. */
         fault(s, ZB_DMA_FAULT);
         disconnect_peer(s);
+    } else if (!s->fault) {
+        /* No published DMA authority: a fresh driver may start at seq=1. */
+        memset(s->banks, 0, sizeof(s->banks));
+        s->snapshot_seq = 0;
+        s->state = 0;
     }
 }
 

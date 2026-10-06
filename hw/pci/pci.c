@@ -3108,10 +3108,8 @@ int pci_iommu_register_iotlb_notifier(PCIDevice *dev, uint32_t pasid,
 
     pci_device_get_iommu_bus_devfn(dev, &iommu_bus, &bus, &devfn);
     if (iommu_bus && iommu_bus->iommu_ops->register_iotlb_notifier) {
-        iommu_bus->iommu_ops->register_iotlb_notifier(bus,
-                                           iommu_bus->iommu_opaque, devfn,
-                                           pasid, n);
-        return 0;
+        return iommu_bus->iommu_ops->register_iotlb_notifier(
+            bus, iommu_bus->iommu_opaque, devfn, pasid, n);
     }
 
     return -ENODEV;

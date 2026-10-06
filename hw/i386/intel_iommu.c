@@ -4821,16 +4821,16 @@ static void vtd_get_iotlb_info(void *opaque, uint8_t *addr_width,
     *min_page_size = VTD_PAGE_SIZE;
 }
 
-static void vtd_register_iotlb_notifier(PCIBus *bus, void *opaque,
-                                        int devfn, uint32_t pasid,
-                                        IOMMUNotifier *n)
+static int vtd_register_iotlb_notifier(PCIBus *bus, void *opaque, int devfn,
+                                       uint32_t pasid, IOMMUNotifier *n)
 {
     IntelIOMMUState *s = opaque;
     VTDAddressSpace *vtd_as;
 
     vtd_as = vtd_find_add_as(s, bus, devfn, pasid);
-    memory_region_register_iommu_notifier(MEMORY_REGION(&vtd_as->iommu), n,
-                                          &error_fatal);
+    /* A guest can enable ATS even when device-IOTLB is unsupported. */
+    return memory_region_register_iommu_notifier(MEMORY_REGION(&vtd_as->iommu),
+                                                 n, NULL);
 }
 
 static void vtd_unregister_iotlb_notifier(PCIBus *bus, void *opaque,

@@ -509,9 +509,11 @@ typedef struct PCIIOMMUOps {
      * @pasid: the pasid of the address space to watch.
      *
      * @n: the notifier to register.
+     *
+     * Returns zero on success, or a negative errno if unsupported.
      */
-    void (*register_iotlb_notifier)(PCIBus *bus, void *opaque, int devfn,
-                                    uint32_t pasid, IOMMUNotifier *n);
+    int (*register_iotlb_notifier)(PCIBus *bus, void *opaque, int devfn,
+                                   uint32_t pasid, IOMMUNotifier *n);
     /**
      * @unregister_iotlb_notifier: remove an IOTLB invalidation notifier.
      *
