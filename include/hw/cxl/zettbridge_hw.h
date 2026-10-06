@@ -53,6 +53,16 @@
 #define ZB_HDM_BASE 0x0350
 #define ZB_HDM_SIZE 0x0358
 #define ZB_CAPACITY 0x0360 /* read-only configured aperture, before publication */
+/* ATS status bits: 0 configured, 1 enabled, 2 invalidation notifier live. */
+#define ZB_ATS_STATUS 0x0368
+#define ZB_ATS_REQUESTS 0x0370
+#define ZB_ATS_HITS 0x0378
+#define ZB_ATS_INVALIDATIONS 0x0380
+#define ZB_ATS_ENTRIES 0x0388
+#define ZB_ATS_FLUSHES 0x0390
+#define ZB_ATS_FAULTS 0x0398
+#define ZB_ATS_TRANSITIONS 0x03a0
+#define ZB_ATS_TEST_VALUE 0x03a8 /* read-only synchronous TEST_ATS result */
 #define ZB_ENABLE 1
 #define ZB_QUIESCE 2
 #define ZB_DRAIN 3
@@ -65,6 +75,7 @@
 #define ZB_TEST_DMA 0x102
 #define ZB_ZERO_RANGE 0x103
 #define ZB_REQUEST_REVOKE 0x104
+#define ZB_TEST_ATS 0x105
 #define ZB_OK 0
 #define ZB_BUSY 1
 #define ZB_BAD_ABI 2

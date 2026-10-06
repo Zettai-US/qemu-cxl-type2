@@ -19,9 +19,19 @@
 #include "hw/qdev-properties.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pcie.h"
+#include "hw/pci/pci_bus.h"
 #include "hw/cxl/zettbridge.h"
 #include "hw/cxl/zettbridge_hw.h"
 #include "migration/vmstate.h"
+
+#define ZB_ATC_SIZE 256
+#define ZB_ATS_CAP_OFFSET 0x100
+
+typedef struct ZBTranslation {
+    uint64_t iova, translated;
+    AddressSpace *target;
+    IOMMUAccessFlags perm;
+} ZBTranslation;
 
 /* Fixed local IPC wire protocol; no pointers, host addresses or shared RAM. */
 typedef struct ZBPacket {
@@ -53,6 +63,11 @@ struct ZettBridge {
     bool query_unknown;
     int listener, peer;
     bool realized;
+    bool ats, ats_notifier_registered;
+    IOMMUNotifier ats_notifier;
+    ZBTranslation atc[ZB_ATC_SIZE];
+    uint64_t ats_requests, ats_hits, ats_invalidations, ats_flushes;
+    uint64_t ats_faults, ats_transitions;
     ZBBank banks[2]; /* B=0, A=1, separate staging/completion/query banks */
     ZBExtent *extents;
     uint32_t count;
@@ -66,6 +81,123 @@ struct ZettBridge {
     uint32_t state, fault;
 };
 
+static void atc_flush(ZettBridge *s)
+{
+    memset(s->atc, 0, sizeof(s->atc));
+    s->ats_flushes++;
+}
+
+static unsigned atc_entries(ZettBridge *s)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < ZB_ATC_SIZE; i++) {
+        n += s->atc[i].perm != IOMMU_NONE;
+    }
+    return n;
+}
+
+static void atc_invalidate(IOMMUNotifier *n, IOMMUTLBEntry *entry)
+{
+    ZettBridge *s = n->opaque;
+    uint64_t last = entry->iova | entry->addr_mask;
+
+    /*
+     * The VT-d queued invalidation completes after this callback returns.
+     * BQL serializes translations, synchronous DMA and invalidation, including
+     * accesses received from the other QEMU. No outstanding translated access
+     * can outlive this completion. PASID/SVA are not advertised.
+     */
+    assert(bql_locked());
+    s->ats_invalidations++;
+    for (unsigned i = 0; i < ZB_ATC_SIZE; i++) {
+        ZBTranslation *t = &s->atc[i];
+        if (t->perm && t->iova <= last &&
+            entry->iova <= (t->iova | (ZB_ALIGN - 1))) {
+            t->perm = IOMMU_NONE;
+        }
+    }
+}
+
+static void ats_unregister(ZettBridge *s)
+{
+    atc_flush(s);
+    if (s->ats_notifier_registered) {
+        pci_iommu_unregister_iotlb_notifier(PCI_DEVICE(s), PCI_NO_PASID,
+                                            &s->ats_notifier);
+        s->ats_notifier_registered = false;
+    }
+}
+
+static MemTxResult bridge_dma(ZettBridge *s, uint64_t addr, void *buf,
+                              size_t size, bool write)
+{
+    PCIDevice *dev = PCI_DEVICE(s);
+    IOMMUAccessFlags needed = write ? IOMMU_WO : IOMMU_RO;
+    DMADirection direction =
+        write ? DMA_DIRECTION_FROM_DEVICE : DMA_DIRECTION_TO_DEVICE;
+    uint8_t *bytes = buf;
+
+    if (!s->ats) {
+        return pci_dma_rw(dev, addr, buf, size, direction,
+                          MEMTXATTRS_UNSPECIFIED);
+    }
+    /* An ATS export must not silently fall back when ATS is disabled. */
+    if (!dev->is_master || !pcie_ats_enabled(dev) ||
+        !s->ats_notifier_registered || !size || size - 1 > UINT64_MAX - addr) {
+        s->ats_faults++;
+        return MEMTX_ERROR;
+    }
+    while (size) {
+        uint64_t page = addr & ~(uint64_t)(ZB_ALIGN - 1);
+        unsigned offset = addr & (ZB_ALIGN - 1);
+        size_t count = MIN(size, ZB_ALIGN - offset);
+        ZBTranslation *t = &s->atc[(page / ZB_ALIGN) % ZB_ATC_SIZE];
+
+        if (t->iova == page && (t->perm & needed) == needed) {
+            s->ats_hits++;
+        } else {
+            IOMMUTLBEntry entry;
+            uint32_t errors = 0;
+            ssize_t result;
+
+            s->ats_requests++;
+            result = pci_ats_request_translation(dev, PCI_NO_PASID, false,
+                                                 false, addr, 1, !write, &entry,
+                                                 1, &errors);
+            if (result != 1 || errors || !entry.target_as ||
+                (entry.perm & needed) != needed ||
+                entry.addr_mask < ZB_ALIGN - 1 ||
+                (addr & ~entry.addr_mask) != entry.iova) {
+                t->perm = IOMMU_NONE;
+                s->ats_faults++;
+                return MEMTX_ERROR;
+            }
+            *t = (ZBTranslation){
+                .iova = page,
+                .translated = entry.translated_addr + (page & entry.addr_mask),
+                .target = entry.target_as,
+                .perm = entry.perm & IOMMU_RW,
+            };
+        }
+        /*
+         * Translated requests use the IOMMU-returned target address space.
+         * Passing the translated address through pci_dma_rw would translate it
+         * a second time. memory=true rejects MMIO, including MSI injection.
+         */
+        MemTxResult result =
+            dma_memory_rw(t->target, t->translated + offset, bytes, count,
+                          direction, (MemTxAttrs){.memory = true});
+        if (result != MEMTX_OK) {
+            s->ats_faults++;
+            return result;
+        }
+        addr += count;
+        bytes += count;
+        size -= count;
+    }
+    return MEMTX_OK;
+}
+
 static uint64_t reg64(ZBBank *b, unsigned off)
 {
     return ldq_le_p(b->reg + off);
@@ -77,6 +209,43 @@ static void fault(ZettBridge *s, unsigned code)
         s->fault = code;
     }
     s->state = 6;
+    atc_flush(s);
+}
+
+static void zb_write_config(PCIDevice *dev, uint32_t addr, uint32_t value,
+                            int len)
+{
+    ZettBridge *s = ZETTBRIDGE(dev);
+    bool was_enabled = pcie_ats_enabled(dev);
+    unsigned offset = ZB_ATS_CAP_OFFSET + PCI_ATS_CTRL;
+    uint16_t old_ctrl = s->ats ? pci_get_word(dev->config + offset) : 0;
+    uint16_t ctrl;
+
+    pci_default_write_config(dev, addr, value, len);
+    if (!s->ats) {
+        return;
+    }
+    ctrl = pci_get_word(dev->config + offset);
+    if (ctrl == old_ctrl) {
+        return;
+    }
+    s->ats_transitions++;
+    ats_unregister(s);
+    if (was_enabled && s->state >= 1 && s->state <= 4) {
+        fault(s, ZB_DMA_FAULT);
+    }
+    if (pcie_ats_enabled(dev)) {
+        /* The profile uses 4 KiB translation units. */
+        if (PCI_ATS_CTRL_STU(ctrl) ||
+            pci_iommu_init_iotlb_notifier(dev, &s->ats_notifier, atc_invalidate,
+                                          s) ||
+            pci_iommu_register_iotlb_notifier(dev, PCI_NO_PASID,
+                                              &s->ats_notifier)) {
+            fault(s, ZB_DMA_FAULT);
+            return;
+        }
+        s->ats_notifier_registered = true;
+    }
 }
 
 static uint32_t table_fetch(ZettBridge *s, ZBBank *b, ZBExtent **out,
@@ -94,7 +263,7 @@ static uint32_t table_fetch(ZettBridge *s, ZBBank *b, ZBExtent **out,
     for (uint32_t i = 0; i < count; i++) {
         uint8_t raw[64];
         uint64_t dpa, len, dma;
-        if (pci_dma_read(PCI_DEVICE(s), base + i * 64, raw, 64)) {
+        if (bridge_dma(s, base + i * 64, raw, 64, false)) {
             g_free(table);
             return ZB_DMA_FAULT;
         }
@@ -146,8 +315,7 @@ static uint32_t dma_range(ZettBridge *s, uint64_t dpa, uint8_t *buf,
         }
         unsigned n = MIN(size, e->length - (dpa - e->dpa));
         uint64_t dma = e->dma + (dpa - e->dpa);
-        MemTxResult result = write ? pci_dma_write(PCI_DEVICE(s), dma, buf, n)
-                                   : pci_dma_read(PCI_DEVICE(s), dma, buf, n);
+        MemTxResult result = bridge_dma(s, dma, buf, n, write);
         if (result != MEMTX_OK) {
             fault(s, ZB_DMA_FAULT);
             return ZB_DMA_FAULT;
@@ -226,6 +394,23 @@ static uint32_t execute(ZettBridge *s, unsigned port, unsigned op)
     if (s->fault) {
         return ZB_DMA_FAULT;
     }
+    if (op == ZB_TEST_ATS) {
+        uint8_t data[8];
+        /*
+         * Pre-publication translation/invalidation self-test, provider only.
+         * There is no persistent DMA request after this synchronous ACK.
+         */
+        if (port || !s->ats || s->attached ||
+            (s->state != 0 && s->state != 1 && s->state != 5) ||
+            (reg64(b, ZB_TABLE_BASE) & (ZB_ALIGN - 1))) {
+            return ZB_DENIED;
+        }
+        if (bridge_dma(s, reg64(b, ZB_TABLE_BASE), data, sizeof(data), false)) {
+            return ZB_DMA_FAULT;
+        }
+        memcpy(b->reg + ZB_ATS_TEST_VALUE, data, sizeof(data));
+        return ZB_OK;
+    }
     if (op == ZB_COMMIT_OP || op == ZB_TEST_DMA) {
         if (s->attached || (s->state != 0 && s->state != 1 && s->state != 5)) {
             return ZB_NOT_QUIESCED;
@@ -243,16 +428,16 @@ static uint32_t execute(ZettBridge *s, unsigned port, unsigned op)
             for (unsigned i = 0; i < count && !status; i++) {
                 for (uint64_t off = 0; off < table[i].length;
                      off += sizeof(data)) {
-                    if (pci_dma_read(PCI_DEVICE(s), table[i].dma + off, data,
-                                     sizeof(data))) {
+                    if (bridge_dma(s, table[i].dma + off, data, sizeof(data),
+                                   false)) {
                         status = ZB_DMA_FAULT;
                         break;
                     }
                     for (unsigned j = 0; j < sizeof(data); j++) {
                         data[j] ^= 0xff;
                     }
-                    if (pci_dma_write(PCI_DEVICE(s), table[i].dma + off, data,
-                                      sizeof(data))) {
+                    if (bridge_dma(s, table[i].dma + off, data, sizeof(data),
+                                   true)) {
                         status = ZB_DMA_FAULT;
                         break;
                     }
@@ -329,6 +514,11 @@ static uint32_t execute(ZettBridge *s, unsigned port, unsigned op)
         g_clear_pointer(&s->extents, g_free);
         s->count = 0;
         s->exported = 0;
+        /*
+         * RETIRE ACK proves both extent removal and ATC retirement. ATS stays
+         * enabled while Linux subsequently unmaps/frees the backing.
+         */
+        atc_flush(s);
         s->state = 5;
         return ZB_OK;
     case ZB_LEASE_BARRIER:
@@ -411,6 +601,31 @@ static uint32_t bar_read(ZettBridge *s, unsigned port, unsigned addr)
         break;
     case ZB_CAPACITY:
         value = s->capacity;
+        break;
+    case ZB_ATS_STATUS:
+        value = s->ats | ((uint64_t)pcie_ats_enabled(PCI_DEVICE(s)) << 1) |
+                ((uint64_t)s->ats_notifier_registered << 2);
+        break;
+    case ZB_ATS_REQUESTS:
+        value = s->ats_requests;
+        break;
+    case ZB_ATS_HITS:
+        value = s->ats_hits;
+        break;
+    case ZB_ATS_INVALIDATIONS:
+        value = s->ats_invalidations;
+        break;
+    case ZB_ATS_ENTRIES:
+        value = atc_entries(s);
+        break;
+    case ZB_ATS_FLUSHES:
+        value = s->ats_flushes;
+        break;
+    case ZB_ATS_FAULTS:
+        value = s->ats_faults;
+        break;
+    case ZB_ATS_TRANSITIONS:
+        value = s->ats_transitions;
         break;
     case ZB_FAULT:
         value = s->fault;
@@ -656,6 +871,10 @@ static void zb_realize(PCIDevice *pdev, Error **errp)
     ZettBridge *s = ZETTBRIDGE(pdev);
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
     s->listener = s->peer = -1;
+    if (s->ats && !s->provider) {
+        error_setg(errp, "zettbridge ATS requires the provider requester");
+        return;
+    }
     if (!s->socket_path || strlen(s->socket_path) >= sizeof(addr.sun_path) ||
         !s->capacity || (s->capacity & ((256 * MiB) - 1)) || !s->timeout_ms ||
         s->timeout_ms > 30000) {
@@ -692,6 +911,9 @@ static void zb_realize(PCIDevice *pdev, Error **errp)
     pci_set_word(pdev->config + PCI_DEVICE_ID,
                  s->provider ? ZB_PROVIDER_DEVICE : ZB_CONSUMER_DEVICE);
     pcie_endpoint_cap_init(pdev, 0x80);
+    if (s->ats) {
+        pcie_ats_init(pdev, ZB_ATS_CAP_OFFSET, true);
+    }
     memory_region_init_io(&s->bar, OBJECT(s), &zb_ops, s, "zettai-rpu-mgmt",
                           ZB_BAR_SIZE);
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->bar);
@@ -701,6 +923,7 @@ static void zb_realize(PCIDevice *pdev, Error **errp)
 static void zb_exit(PCIDevice *pdev)
 {
     ZettBridge *s = ZETTBRIDGE(pdev);
+    ats_unregister(s);
     disconnect_peer(s);
     if (s->listener >= 0) {
         qemu_set_fd_handler(s->listener, NULL, NULL, NULL);
@@ -714,6 +937,11 @@ static void zb_exit(PCIDevice *pdev)
 static void zb_reset(DeviceState *dev)
 {
     ZettBridge *s = ZETTBRIDGE(dev);
+    ats_unregister(s);
+    if (s->ats) {
+        unsigned offset = ZB_ATS_CAP_OFFSET + PCI_ATS_CTRL;
+        pci_set_word(PCI_DEVICE(s)->config + offset, 0);
+    }
     if (s->realized && (s->epoch || s->ever_attached)) {
         /* A reset never authorizes old backing/mapping reuse. */
         fault(s, ZB_DMA_FAULT);
@@ -723,6 +951,7 @@ static void zb_reset(DeviceState *dev)
 
 static const Property zb_props[] = {
     DEFINE_PROP_BOOL("provider", ZettBridge, provider, false),
+    DEFINE_PROP_BOOL("ats", ZettBridge, ats, false),
     DEFINE_PROP_STRING("socket", ZettBridge, socket_path),
     DEFINE_PROP_SIZE("capacity", ZettBridge, capacity, 256 * MiB),
     DEFINE_PROP_UINT32("timeout-ms", ZettBridge, timeout_ms, 2000),
@@ -739,6 +968,7 @@ static void zb_class_init(ObjectClass *klass, const void *data)
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
     pc->realize = zb_realize;
     pc->exit = zb_exit;
+    pc->config_write = zb_write_config;
     pc->vendor_id = ZB_VENDOR;
     pc->device_id = ZB_PROVIDER_DEVICE;
     pc->revision = 2;
