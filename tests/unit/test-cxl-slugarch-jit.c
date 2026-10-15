@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 #include "hw/cxl/slugarch_jit.h"
 #include "qemu/units.h"
+#include "qapi/error.h"
 
 static const char real_policy[] =
     "{"
