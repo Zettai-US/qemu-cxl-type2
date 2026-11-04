@@ -22,10 +22,15 @@
 #include "hw/pci/pci_bus.h"
 #include "hw/cxl/zettbridge.h"
 #include "hw/cxl/zettbridge_hw.h"
+#include "hw/vfio-user/protocol.h"
 #include "migration/vmstate.h"
 
 #define ZB_ATC_SIZE 256
 #define ZB_ATS_CAP_OFFSET 0x100
+/* Private vfio-user commands, valid only after zettbridge_cxl negotiation. */
+#define ZB_VFIO_CXL_READ 0x8001
+#define ZB_VFIO_CXL_WRITE 0x8002
+static const char zb_vfio_caps[] = "{\"capabilities\":{\"zettbridge_cxl\":1}}";
 
 typedef struct ZBTranslation {
     uint64_t iova, translated;
@@ -40,6 +45,14 @@ typedef struct ZBPacket {
     uint8_t data[64];
 } ZBPacket;
 G_STATIC_ASSERT(sizeof(ZBPacket) == 96);
+
+typedef struct ZBVFIOUserRW {
+    VFIOUserHdr hdr;
+    uint64_t offset;
+    uint32_t region, count;
+    uint8_t data[64];
+} ZBVFIOUserRW;
+G_STATIC_ASSERT(sizeof(ZBVFIOUserRW) == 96);
 
 typedef struct ZBBank {
     uint8_t reg[ZB_BAR_SIZE];
@@ -56,6 +69,8 @@ struct ZettBridge {
     PCIDevice parent_obj;
     MemoryRegion bar;
     bool provider;
+    bool vfio_user_cxl;
+    uint16_t vfio_user_id;
     char *socket_path;
     uint64_t capacity;
     uint32_t timeout_ms;
@@ -764,8 +779,142 @@ static void accept_peer(void *opaque)
     qemu_set_fd_handler(fd, receive_packet, NULL, s);
 }
 
+static bool vfio_user_send_all(int fd, const void *buf, size_t size)
+{
+    const uint8_t *bytes = buf;
+
+    while (size) {
+        ssize_t n = send(fd, bytes, size, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        bytes += n;
+        size -= n;
+    }
+    return true;
+}
+
+static bool vfio_user_recv_all(int fd, void *buf, size_t size)
+{
+    uint8_t *bytes = buf;
+
+    while (size) {
+        ssize_t n = recv(fd, bytes, size, 0);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        bytes += n;
+        size -= n;
+    }
+    return true;
+}
+
+static bool vfio_user_cxl_handshake(int fd)
+{
+    uint8_t request[sizeof(VFIOUserVersion) + sizeof(zb_vfio_caps)] = {0};
+    uint8_t reply[sizeof(request)] = {0};
+    VFIOUserVersion *version = (VFIOUserVersion *)request;
+    VFIOUserHdr header;
+
+    version->hdr = (VFIOUserHdr) {
+        .id = 1, .command = VFIO_USER_VERSION, .size = sizeof(request),
+        .flags = VFIO_USER_REQUEST,
+    };
+    version->major = VFIO_USER_MAJOR_VER;
+    version->minor = VFIO_USER_MINOR_VER;
+    memcpy(version->capabilities, zb_vfio_caps, sizeof(zb_vfio_caps));
+    if (!vfio_user_send_all(fd, request, sizeof(request)) ||
+        !vfio_user_recv_all(fd, &header, sizeof(header)) ||
+        header.id != 1 || header.command != VFIO_USER_VERSION ||
+        header.flags != VFIO_USER_REPLY || header.error_reply ||
+        header.size != sizeof(reply) ||
+        !vfio_user_recv_all(fd, reply + sizeof(header),
+                            sizeof(reply) - sizeof(header))) {
+        return false;
+    }
+    version = (VFIOUserVersion *)reply;
+    return version->major == VFIO_USER_MAJOR_VER &&
+           version->minor == VFIO_USER_MINOR_VER &&
+           !memcmp(version->capabilities, zb_vfio_caps, sizeof(zb_vfio_caps));
+}
+
+static bool vfio_user_cxl_transact(ZettBridge *s, ZBPacket *p)
+{
+    ZBVFIOUserRW request = {0}, reply = {0};
+    unsigned op = le32_to_cpu(p->op);
+    unsigned count = le32_to_cpu(p->size);
+    bool write = op == 1 || op == 3;
+    VFIOUserHdr header;
+    size_t reply_size = sizeof(reply) - sizeof(reply.data) +
+                        (write ? 0 : count);
+
+    if (count > sizeof(request.data) || op > 3) {
+        return false;
+    }
+    request.hdr = (VFIOUserHdr) {
+        .id = ++s->vfio_user_id,
+        .command = op == 0 ? VFIO_USER_REGION_READ :
+                   op == 1 ? VFIO_USER_REGION_WRITE :
+                   op == 2 ? ZB_VFIO_CXL_READ : ZB_VFIO_CXL_WRITE,
+        .size = sizeof(request) - sizeof(request.data) + (write ? count : 0),
+        .flags = VFIO_USER_REQUEST,
+    };
+    request.offset = le64_to_cpu(p->addr);
+    request.count = count;
+    if (write) {
+        if (op == 1) {
+            memcpy(request.data, &p->value, count);
+        } else {
+            memcpy(request.data, p->data, count);
+        }
+    }
+    if (!vfio_user_send_all(s->peer, &request, request.hdr.size) ||
+        !vfio_user_recv_all(s->peer, &header, sizeof(header)) ||
+        header.id != request.hdr.id ||
+        header.command != request.hdr.command ||
+        (header.flags != VFIO_USER_REPLY &&
+         header.flags != (VFIO_USER_REPLY | VFIO_USER_ERROR)) ||
+        header.size != (header.flags & VFIO_USER_ERROR ? sizeof(header) :
+                        reply_size)) {
+        disconnect_peer(s);
+        return false;
+    }
+    if (header.flags & VFIO_USER_ERROR) {
+        p->status = cpu_to_le32(header.error_reply == EACCES ?
+                                ZB_DENIED : ZB_DMA_FAULT);
+        return false;
+    }
+    reply.hdr = header;
+    if (!vfio_user_recv_all(s->peer, (uint8_t *)&reply + sizeof(header),
+                            reply_size - sizeof(header)) ||
+        reply.offset != request.offset || reply.region != 0 ||
+        reply.count != count) {
+        disconnect_peer(s);
+        return false;
+    }
+    if (!write) {
+        if (op == 0) {
+            memcpy(&p->value, reply.data, count);
+        } else {
+            memcpy(p->data, reply.data, count);
+        }
+    }
+    p->status = cpu_to_le32(ZB_OK);
+    s->ever_attached = true;
+    return true;
+}
+
 static bool transact(ZettBridge *s, ZBPacket *p)
 {
+    if (s->vfio_user_cxl) {
+        return s->peer >= 0 && vfio_user_cxl_transact(s, p);
+    }
     struct pollfd fd = {.fd = s->peer, .events = POLLIN};
     if (s->peer < 0 ||
         send(s->peer, p, sizeof(*p), MSG_NOSIGNAL | MSG_DONTWAIT) !=
@@ -871,6 +1020,10 @@ static void zb_realize(PCIDevice *pdev, Error **errp)
     ZettBridge *s = ZETTBRIDGE(pdev);
     struct sockaddr_un addr = {.sun_family = AF_UNIX};
     s->listener = s->peer = -1;
+    if (s->provider && s->vfio_user_cxl) {
+        error_setg(errp, "vfio-user CXL transport is consumer-only");
+        return;
+    }
     if (s->ats && !s->provider) {
         error_setg(errp, "zettbridge ATS requires the provider requester");
         return;
@@ -883,7 +1036,8 @@ static void zb_realize(PCIDevice *pdev, Error **errp)
         return;
     }
     pstrcpy(addr.sun_path, sizeof(addr.sun_path), s->socket_path);
-    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    int fd = socket(AF_UNIX, (s->vfio_user_cxl ? SOCK_STREAM : SOCK_SEQPACKET) |
+                             SOCK_CLOEXEC, 0);
     if (fd < 0) {
         error_setg_errno(errp, errno, "zettbridge socket");
         return;
@@ -905,6 +1059,21 @@ static void zb_realize(PCIDevice *pdev, Error **errp)
                              addr.sun_path);
             close(fd);
             return;
+        }
+        if (s->vfio_user_cxl) {
+            struct timeval timeout = {
+                .tv_sec = s->timeout_ms / 1000,
+                .tv_usec = (s->timeout_ms % 1000) * 1000,
+            };
+            if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                           sizeof(timeout)) ||
+                setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                           sizeof(timeout)) ||
+                !vfio_user_cxl_handshake(fd)) {
+                error_setg(errp, "zettbridge vfio-user CXL handshake failed");
+                close(fd);
+                return;
+            }
         }
         s->peer = fd;
     }
@@ -956,6 +1125,7 @@ static void zb_reset(DeviceState *dev)
 
 static const Property zb_props[] = {
     DEFINE_PROP_BOOL("provider", ZettBridge, provider, false),
+    DEFINE_PROP_BOOL("vfio-user-cxl", ZettBridge, vfio_user_cxl, false),
     DEFINE_PROP_BOOL("ats", ZettBridge, ats, false),
     DEFINE_PROP_STRING("socket", ZettBridge, socket_path),
     DEFINE_PROP_SIZE("capacity", ZettBridge, capacity, 256 * MiB),
